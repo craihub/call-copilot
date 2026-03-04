@@ -63,3 +63,4 @@ echo ""
 echo "✓ Installed."
 echo "  Run: call-copilot"
 echo "  GEMINI_API_KEY can be entered in the app Settings panel."
+# v1.1.0
