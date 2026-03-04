@@ -1,0 +1,67 @@
+name: Build macOS App
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PortAudio (required by PyAudio)
+        run: brew install portaudio
+
+      - name: Install Python deps + PyInstaller
+        run: |
+          pip install --upgrade pip
+          pip install pyaudio PyQt6 websockets pyinstaller
+
+      - name: Build .app with PyInstaller
+        run: |
+          pyinstaller \
+            --name "CallCopilot" \
+            --windowed \
+            --onefile \
+            --icon NONE \
+            --add-data "README.md:." \
+            --hidden-import PyQt6.sip \
+            --hidden-import PyQt6.QtCore \
+            --hidden-import PyQt6.QtGui \
+            --hidden-import PyQt6.QtWidgets \
+            main.py
+
+      - name: Package as DMG
+        run: |
+          brew install create-dmg
+          create-dmg \
+            --volname "CallCopilot" \
+            --window-pos 200 120 \
+            --window-size 600 300 \
+            --icon-size 100 \
+            --app-drop-link 425 120 \
+            "CallCopilot.dmg" \
+            "dist/"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallCopilot-macOS
+          path: CallCopilot.dmg
+          retention-days: 14
+
+      - name: Upload raw .app (fallback)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallCopilot-app-raw
+          path: dist/CallCopilot
+          retention-days: 14
