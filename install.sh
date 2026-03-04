@@ -13,7 +13,10 @@ if ! command -v brew &>/dev/null; then
 fi
 
 echo "→ Installing python@3.11 + tk support + portaudio..."
-brew install python@3.11 python-tk@3.11 portaudio 2>/dev/null || true
+brew install python@3.11 portaudio 2>/dev/null || true
+
+# python-tk@3.11 has a broken pip step on some systems — install separately, ignore errors
+brew install python-tk@3.11 2>/dev/null || true
 
 PYTHON="$(brew --prefix)/bin/python3.11"
 if [ ! -x "$PYTHON" ]; then
@@ -24,8 +27,6 @@ fi
 echo "→ Using Python: $PYTHON"
 "$PYTHON" --version
 
-VENV_DIR="$INSTALL_DIR/.venv"
-
 echo "→ Cloning repo..."
 if [ -d "$INSTALL_DIR/.git" ]; then
   git -C "$INSTALL_DIR" pull --ff-only
@@ -34,6 +35,7 @@ else
 fi
 
 echo "→ Creating virtualenv with python@3.11..."
+VENV_DIR="$INSTALL_DIR/.venv"
 "$PYTHON" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --upgrade pip -q
 "$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q
@@ -53,5 +55,7 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
   echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
 fi
 
-echo "✓ Done. Run: call-copilot"
-echo "  (If command not found: export PATH=\"\$HOME/.local/bin:\$PATH\")"
+echo ""
+echo "✓ Installed."
+echo "  call-copilot"
+echo "  GEMINI_API_KEY can be set in the app Settings panel."
