@@ -17,8 +17,21 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+import logging
 import pyaudio
 import websockets
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+LOG_FILE = Path.home() / ".call-copilot" / "copilot.log"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, mode="a"),
+        logging.StreamHandler(sys.stderr),
+    ],
+)
+log = logging.getLogger("copilot")
 from PyQt6.QtCore import Qt, QPoint, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QIcon, QFont, QColor, QPalette, QAction, QPixmap, QPainter
 from PyQt6.QtWidgets import (
@@ -152,15 +165,21 @@ class GeminiLiveClient:
 
     def start(self):
         self._loop = asyncio.new_event_loop()
+        log.info("Starting Gemini client thread")
         threading.Thread(target=self._run_loop, daemon=True).start()
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._connect())
+        try:
+            self._loop.run_until_complete(self._connect())
+        except Exception as e:
+            log.exception("Event loop crashed")
+            self.on_error(f"Connection failed: {e}")
 
     async def _connect(self):
         uri = WS_URI_TMPL.format(api_key=self.api_key)
-        self.on_status("Connecting…")
+        self.on_status("Connecting...")
+        log.info("Connecting to %s", uri[:80] + "...")
         try:
             async with websockets.connect(
                 uri,
@@ -170,19 +189,32 @@ class GeminiLiveClient:
                 ping_timeout=10,
             ) as ws:
                 self.running = True
-                await ws.send(json.dumps(self.build_setup()))
-                resp = json.loads(await ws.recv())
+                setup_msg = self.build_setup()
+                log.debug("Sending setup: %s", json.dumps(setup_msg)[:200])
+                await ws.send(json.dumps(setup_msg))
+                raw_resp = await ws.recv()
+                resp = json.loads(raw_resp)
+                log.debug("Setup response: %s", json.dumps(resp)[:500])
                 if "error" in resp:
-                    self.on_error(str(resp["error"]))
+                    err_msg = str(resp["error"])
+                    log.error("Setup error from Gemini: %s", err_msg)
+                    self.on_error(err_msg)
                     return
                 self.on_status("[LIVE] Listening...")
+                log.info("Connected and listening")
                 await asyncio.gather(self._send_loop(ws), self._recv_loop(ws))
         except websockets.exceptions.ConnectionClosedOK:
+            log.info("WebSocket closed normally")
             self.on_status("Disconnected")
+        except websockets.exceptions.ConnectionClosedError as e:
+            log.error("WebSocket closed with error: %s", e)
+            self.on_error(f"Connection lost: {e}")
         except Exception as e:
+            log.exception("Connection error")
             self.on_error(f"Error: {e}")
         finally:
             self.running = False
+            log.info("Gemini client stopped")
 
     async def _send_loop(self, ws):
         loop = asyncio.get_event_loop()
@@ -251,10 +283,12 @@ class AudioCapture(threading.Thread):
             if dev_idx is not None:
                 try:
                     info = pa.get_device_info_by_index(dev_idx)
+                    log.info("Audio device %d: %s (channels=%d)", dev_idx, info.get("name"), info.get("maxInputChannels", 0))
                     if info.get("maxInputChannels", 0) < 1:
                         self.client.on_error(f"Device {dev_idx} has no input channels")
                         return
                 except Exception as e:
+                    log.error("Invalid audio device %d: %s", dev_idx, e)
                     self.client.on_error(f"Invalid audio device {dev_idx}: {e}")
                     return
             else:
@@ -262,10 +296,13 @@ class AudioCapture(threading.Thread):
                 try:
                     default = pa.get_default_input_device_info()
                     dev_idx = default["index"]
+                    log.info("Using default input device %d: %s", dev_idx, default.get("name"))
                 except Exception as e:
+                    log.error("No default input device: %s", e)
                     self.client.on_error(f"No default input device: {e}")
                     return
 
+            log.info("Opening audio stream: rate=%d, channels=%d, chunk=%d, device=%d", AUDIO_RATE, AUDIO_CHANNELS, CHUNK_SIZE, dev_idx)
             stream = pa.open(
                 format=AUDIO_FORMAT,
                 channels=AUDIO_CHANNELS,
@@ -274,15 +311,19 @@ class AudioCapture(threading.Thread):
                 input_device_index=dev_idx,
                 frames_per_buffer=CHUNK_SIZE,
             )
+            log.info("Audio stream opened successfully")
             while not self._stop_event.is_set():
                 try:
                     data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
                     self.client.push_audio(data)
-                except OSError:
+                except OSError as e:
+                    log.error("Audio read error: %s", e)
                     break
+            log.info("Audio capture loop ended")
             stream.stop_stream()
             stream.close()
         except Exception as e:
+            log.exception("Audio capture error")
             self.client.on_error(f"Audio error: {e}")
         finally:
             pa.terminate()
@@ -615,9 +656,11 @@ class CopilotWindow(QMainWindow):
         sb.setValue(sb.maximum())
 
     def _set_status(self, text: str):
+        log.info("Status: %s", text)
         self._status_label.setText(text)
 
     def _show_error(self, text: str):
+        log.error("Error shown: %s", text)
         self._set_status(f"✗ {text}")
         if self._active:
             self._stop_listening()
