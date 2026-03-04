@@ -53,11 +53,5 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
   echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
 fi
 
-echo ""
-echo "✓ Installed. Usage:"
-echo ""
-echo "  brew install blackhole-2ch       (one-time: audio loopback)"
-echo "  Set GEMINI_API_KEY in Settings… after first launch"
-echo "  call-copilot"
-echo ""
-echo "  The 🎤 icon will appear in your menu bar."
+echo "✓ Done. Run: call-copilot"
+echo "  (If command not found: export PATH=\"\$HOME/.local/bin:\$PATH\")"
