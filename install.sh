@@ -7,15 +7,15 @@ BIN_DIR="$HOME/.local/bin"
 
 echo "→ Installing Call Copilot..."
 
-# Require Homebrew
+# Ensure Homebrew
 if ! command -v brew &>/dev/null; then
-  echo "✗ Homebrew not found. Install from https://brew.sh then re-run."
+  echo "✗ Homebrew required. Install from https://brew.sh"
   exit 1
 fi
 
-# Install deps — python@3.11 includes tkinter when tcl-tk is present
+# Install dependencies
 echo "→ Installing dependencies..."
-brew install python@3.11 tcl-tk@8 portaudio 2>/dev/null || true
+brew install python@3.11 portaudio 2>/dev/null || true
 
 # Locate python3.11
 PYTHON="$(brew --prefix)/bin/python3.11"
@@ -63,4 +63,3 @@ echo ""
 echo "✓ Installed."
 echo "  Run: call-copilot"
 echo "  GEMINI_API_KEY can be entered in the app Settings panel."
-# v1.1.0
