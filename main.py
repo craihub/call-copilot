@@ -175,7 +175,7 @@ class GeminiLiveClient:
                 if "error" in resp:
                     self.on_error(str(resp["error"]))
                     return
-                self.on_status("🟢 Listening…")
+                self.on_status("[LIVE] Listening...")
                 await asyncio.gather(self._send_loop(ws), self._recv_loop(ws))
         except websockets.exceptions.ConnectionClosedOK:
             self.on_status("Disconnected")
@@ -246,12 +246,32 @@ class AudioCapture(threading.Thread):
     def run(self):
         pa = pyaudio.PyAudio()
         try:
+            # Validate device exists in THIS PyAudio instance to avoid stale index segfault
+            dev_idx = self.device_index
+            if dev_idx is not None:
+                try:
+                    info = pa.get_device_info_by_index(dev_idx)
+                    if info.get("maxInputChannels", 0) < 1:
+                        self.client.on_error(f"Device {dev_idx} has no input channels")
+                        return
+                except Exception as e:
+                    self.client.on_error(f"Invalid audio device {dev_idx}: {e}")
+                    return
+            else:
+                # Fall back to default input device
+                try:
+                    default = pa.get_default_input_device_info()
+                    dev_idx = default["index"]
+                except Exception as e:
+                    self.client.on_error(f"No default input device: {e}")
+                    return
+
             stream = pa.open(
                 format=AUDIO_FORMAT,
                 channels=AUDIO_CHANNELS,
                 rate=AUDIO_RATE,
                 input=True,
-                input_device_index=self.device_index,
+                input_device_index=dev_idx,
                 frames_per_buffer=CHUNK_SIZE,
             )
             while not self._stop_event.is_set():
@@ -262,6 +282,8 @@ class AudioCapture(threading.Thread):
                     break
             stream.stop_stream()
             stream.close()
+        except Exception as e:
+            self.client.on_error(f"Audio error: {e}")
         finally:
             pa.terminate()
 
@@ -328,7 +350,7 @@ class CopilotWindow(QMainWindow):
         bar_layout = QHBoxLayout(bar)
         bar_layout.setContentsMargins(10, 0, 8, 0)
 
-        title = QLabel("🎤  Call Copilot")
+        title = QLabel("Call Copilot")
         title.setStyleSheet(f"color: {ACCENT}; font-size: 13px; font-weight: bold;")
         bar_layout.addWidget(title)
         bar_layout.addStretch()
@@ -371,7 +393,7 @@ class CopilotWindow(QMainWindow):
         self._key_entry.setStyleSheet(entry_style)
         key_row.addWidget(self._key_entry)
 
-        eye_btn = QPushButton("👁")
+        eye_btn = QPushButton("*")
         eye_btn.setFixedSize(28, 28)
         eye_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         eye_btn.setStyleSheet(f"QPushButton {{ background: transparent; border: none; font-size: 14px; }}")
