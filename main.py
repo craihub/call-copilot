@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Real-Time Call Copilot
-Menu bar app (rumps) + floating tkinter suggestions panel.
-Streams system audio (BlackHole loopback) to Gemini Live API.
-Compatible with macOS 12+.
+Single floating window: API key + context + device + start/stop + scrollable bullets.
+Menu bar icon. Auto-hides when screensharing. macOS 12+ compatible.
 """
 
 import asyncio
@@ -11,10 +10,11 @@ import base64
 import json
 import os
 import queue
-import sys
+import subprocess
 import threading
 import tkinter as tk
 from pathlib import Path
+from tkinter import ttk
 from typing import Optional
 
 import pyaudio
@@ -23,7 +23,7 @@ import websockets
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG_DIR  = Path.home() / ".call-copilot"
-CONFIG_FILE = CONFIG_DIR / "config"
+CONFIG_FILE = CONFIG_DIR / "config.json"
 CONFIG_DIR.mkdir(exist_ok=True)
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
@@ -42,31 +42,46 @@ WS_URI_TMPL = (
 )
 
 SYSTEM_PROMPT = (
-    "Act as a silent call copilot. Use the provided context to inform your answers. "
-    "When you hear a question directed at the user, immediately provide 2-3 short, "
-    "high-impact bullet points. Maximum 15 words per bullet. "
-    "No conversational filler. If no question is asked, stay silent. "
-    "Format: each bullet on its own line starting with •"
+    "You are a silent real-time call copilot. "
+    "When you hear a question directed at the user, respond with 2-3 bullet points only. "
+    "Rules: each bullet max 15 words, start with •, one per line, no intro text, no filler. "
+    "If no question is asked, output nothing. "
+    "Use the call context provided to tailor your answers."
 )
+
+# ── Colors ─────────────────────────────────────────────────────────────────────
+BG          = "#0b0d1a"
+BAR_BG      = "#13152a"
+ACCENT      = "#4a8fff"
+TEXT        = "#d0d8ff"
+MUTED       = "#5a6080"
+RED         = "#d04040"
+GREEN       = "#38c060"
+ENTRY_BG    = "#181c34"
+ENTRY_FG    = "#b0bce0"
+BORDER      = "#2a2e50"
+BULLET_FG   = "#4a8fff"
+BODY_FG     = "#d0d8ff"
 
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
 def load_config() -> dict:
-    cfg = {"api_key": "", "device_index": ""}
+    defaults = {"api_key": "", "device_index": "", "context": "", "win_x": "60", "win_y": "60"}
     if CONFIG_FILE.exists():
-        for line in CONFIG_FILE.read_text().splitlines():
-            if "=" in line:
-                k, _, v = line.partition("=")
-                cfg[k.strip()] = v.strip()
-    return cfg
+        try:
+            data = json.loads(CONFIG_FILE.read_text())
+            defaults.update(data)
+        except Exception:
+            pass
+    return defaults
 
 
 def save_config(cfg: dict):
-    CONFIG_FILE.write_text("\n".join(f"{k}={v}" for k, v in cfg.items()))
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
 # ── Audio device list ──────────────────────────────────────────────────────────
-def list_input_devices() -> list[tuple[int, str]]:
+def list_input_devices() -> list:
     pa = pyaudio.PyAudio()
     devices = []
     for i in range(pa.get_device_count()):
@@ -77,19 +92,38 @@ def list_input_devices() -> list[tuple[int, str]]:
     return devices
 
 
+# ── Screenshare detection ──────────────────────────────────────────────────────
+def is_screensharing() -> bool:
+    """Detect if any screencapture/screenshare process is running."""
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-x", "-l", "screencaptureuiagent"], stderr=subprocess.DEVNULL
+        )
+        return bool(out.strip())
+    except subprocess.CalledProcessError:
+        pass
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "screensharing"], stderr=subprocess.DEVNULL
+        )
+        return bool(out.strip())
+    except subprocess.CalledProcessError:
+        return False
+
+
 # ── Gemini Live WebSocket client ───────────────────────────────────────────────
 class GeminiLiveClient:
     def __init__(self, api_key: str, context: str, on_text, on_status, on_error):
-        self.api_key    = api_key
-        self.context    = context
-        self.on_text    = on_text
-        self.on_status  = on_status
-        self.on_error   = on_error
-        self.audio_queue: queue.Queue = queue.Queue(maxsize=100)
-        self.running    = False
+        self.api_key   = api_key
+        self.context   = context
+        self.on_text   = on_text
+        self.on_status = on_status
+        self.on_error  = on_error
+        self.audio_queue: queue.Queue = queue.Queue(maxsize=150)
+        self.running   = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-    def build_setup_message(self) -> dict:
+    def build_setup(self) -> dict:
         instruction = SYSTEM_PROMPT
         if self.context.strip():
             instruction += f"\n\nCall context: {self.context.strip()}"
@@ -106,7 +140,7 @@ class GeminiLiveClient:
                         "disabled": False,
                         "start_of_speech_sensitivity": "START_SENSITIVITY_LOW",
                         "end_of_speech_sensitivity":   "END_SENSITIVITY_HIGH",
-                        "prefix_padding_ms":    20,
+                        "prefix_padding_ms":   20,
                         "silence_duration_ms": 500,
                     }
                 },
@@ -115,8 +149,7 @@ class GeminiLiveClient:
 
     def start(self):
         self._loop = asyncio.new_event_loop()
-        t = threading.Thread(target=self._run_loop, daemon=True)
-        t.start()
+        threading.Thread(target=self._run_loop, daemon=True).start()
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
@@ -134,21 +167,17 @@ class GeminiLiveClient:
                 ping_timeout=10,
             ) as ws:
                 self.running = True
-                self.on_status("Connected — listening…")
-                await ws.send(json.dumps(self.build_setup_message()))
-                resp = await ws.recv()
-                data = json.loads(resp)
-                if "error" in data:
-                    self.on_error(str(data["error"]))
+                await ws.send(json.dumps(self.build_setup()))
+                resp = json.loads(await ws.recv())
+                if "error" in resp:
+                    self.on_error(str(resp["error"]))
                     return
-                await asyncio.gather(
-                    self._send_loop(ws),
-                    self._recv_loop(ws),
-                )
+                self.on_status("🟢 Listening…")
+                await asyncio.gather(self._send_loop(ws), self._recv_loop(ws))
         except websockets.exceptions.ConnectionClosedOK:
             self.on_status("Disconnected")
         except Exception as e:
-            self.on_error(f"WS error: {e}")
+            self.on_error(f"Error: {e}")
         finally:
             self.running = False
 
@@ -159,15 +188,14 @@ class GeminiLiveClient:
                 chunk = await loop.run_in_executor(
                     None, lambda: self.audio_queue.get(timeout=0.05)
                 )
-                msg = {
+                await ws.send(json.dumps({
                     "realtime_input": {
                         "media_chunks": [{
                             "mime_type": AUDIO_MIME,
                             "data": base64.b64encode(chunk).decode(),
                         }]
                     }
-                }
-                await ws.send(json.dumps(msg))
+                }))
             except queue.Empty:
                 continue
             except Exception:
@@ -238,305 +266,371 @@ class AudioCapture(threading.Thread):
         self._stop_event.set()
 
 
-# ── Floating suggestions panel (tkinter) ───────────────────────────────────────
-class SuggestionsPanel:
-    """Always-on-top semi-transparent floating window for AI bullets."""
+# ── Main window (tkinter) ──────────────────────────────────────────────────────
+class CopilotWindow:
+    """Single floating window: config on top, bullets below."""
 
-    def __init__(self):
+    def __init__(self, app_ref):
+        self.app        = app_ref
         self._root: Optional[tk.Tk] = None
-        self._text: Optional[tk.Text] = None
-        self._status_var: Optional[tk.StringVar] = None
-        self._thread: Optional[threading.Thread] = None
-        self._ready = threading.Event()
-        self._queue: queue.Queue = queue.Queue()
+        self._ready     = threading.Event()
+        self._ui_queue: queue.Queue = queue.Queue()
+        self._drag_x    = 0
+        self._drag_y    = 0
+        self._client: Optional[GeminiLiveClient] = None
+        self._audio: Optional[AudioCapture]       = None
+        self._active    = False
+        self._devices   = []
+        self._cfg       = load_config()
+        self._key_visible = False
 
-    def show(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        self._ready.wait(timeout=3)
+    def launch(self):
+        threading.Thread(target=self._run, daemon=True).start()
+        self._ready.wait(timeout=5)
 
+    # ── Build UI ──────────────────────────────────────────────────────────────
     def _run(self):
         self._root = tk.Tk()
-        self._root.title("Call Copilot")
-        self._root.geometry("420x320+40+40")
-        self._root.configure(bg="#0a0a14")
-        self._root.wm_attributes("-topmost", True)
-        self._root.wm_attributes("-alpha", 0.92)
-        self._root.overrideredirect(True)   # frameless
+        root = self._root
 
-        # Drag support
-        self._root.bind("<ButtonPress-1>",   self._drag_start)
-        self._root.bind("<B1-Motion>",       self._drag_motion)
-        self._drag_x = self._drag_y = 0
+        root.title("Call Copilot")
+        root.configure(bg=BG)
+        root.overrideredirect(True)
+        root.wm_attributes("-topmost", True)
+        root.wm_attributes("-alpha", 0.95)
+        root.resizable(False, False)
 
-        # Title bar row
-        bar = tk.Frame(self._root, bg="#16162a", height=28)
+        # Restore position
+        x = int(self._cfg.get("win_x", 60))
+        y = int(self._cfg.get("win_y", 60))
+        root.geometry(f"420x560+{x}+{y}")
+
+        # ── Title bar ─────────────────────────────────────────────────────────
+        bar = tk.Frame(root, bg=BAR_BG, height=32)
         bar.pack(fill="x")
-        bar.bind("<ButtonPress-1>", self._drag_start)
-        bar.bind("<B1-Motion>",     self._drag_motion)
+        bar.pack_propagate(False)
+        bar.bind("<ButtonPress-1>",  self._drag_start)
+        bar.bind("<B1-Motion>",      self._drag_motion)
+        bar.bind("<ButtonRelease-1>", self._drag_end)
 
-        tk.Label(bar, text="🎤 Call Copilot", bg="#16162a",
-                 fg="#a0a0ff", font=("SF Pro Display", 11, "bold")).pack(side="left", padx=8)
+        tk.Label(bar, text="🎤  Call Copilot", bg=BAR_BG, fg=ACCENT,
+                 font=("SF Pro Display", 12, "bold")).pack(side="left", padx=10, pady=4)
 
-        close_btn = tk.Button(bar, text="✕", bg="#16162a", fg="#666",
-                              bd=0, font=("SF Pro Display", 11),
-                              activebackground="#16162a", activeforeground="#ff6b6b",
-                              command=self.hide)
-        close_btn.pack(side="right", padx=6)
+        close_btn = tk.Button(bar, text="✕", bg=BAR_BG, fg=MUTED, bd=0,
+                              font=("SF Pro Display", 12), cursor="hand2",
+                              activebackground=BAR_BG, activeforeground="#ff6060",
+                              command=self._hide)
+        close_btn.pack(side="right", padx=8)
 
-        # Status label
-        self._status_var = tk.StringVar(value="Connecting…")
-        tk.Label(self._root, textvariable=self._status_var,
-                 bg="#0a0a14", fg="#4a9eff",
-                 font=("SF Pro Display", 10)).pack(anchor="w", padx=10, pady=(4, 0))
+        # ── Config section ────────────────────────────────────────────────────
+        cfg_frame = tk.Frame(root, bg=BG)
+        cfg_frame.pack(fill="x", padx=12, pady=(10, 0))
 
-        # Suggestions text area
-        frame = tk.Frame(self._root, bg="#0a0a14")
-        frame.pack(fill="both", expand=True, padx=10, pady=6)
+        # API Key row
+        self._build_label(cfg_frame, "Gemini API Key")
+        key_row = tk.Frame(cfg_frame, bg=BG)
+        key_row.pack(fill="x", pady=(2, 6))
 
-        self._text = tk.Text(
-            frame,
-            bg="#0a0a14", fg="#e0e0ff",
-            font=("SF Pro Display", 12),
-            wrap="word", bd=0, highlightthickness=0,
-            state="disabled", cursor="arrow",
+        self._api_var = tk.StringVar(value=self._cfg.get("api_key", ""))
+        self._key_entry = tk.Entry(
+            key_row, textvariable=self._api_var,
+            show="●", bg=ENTRY_BG, fg=ENTRY_FG, insertbackground=ACCENT,
+            relief="flat", font=("SF Pro Display", 11), bd=0,
+            highlightthickness=1, highlightbackground=BORDER,
+            highlightcolor=ACCENT,
         )
-        self._text.pack(fill="both", expand=True)
+        self._key_entry.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
+        self._key_entry.bind("<KeyRelease>", self._autosave)
 
-        # Tag for bullet styling
-        self._text.tag_configure("bullet", foreground="#4a9eff", font=("SF Pro Display", 12, "bold"))
-        self._text.tag_configure("body",   foreground="#e0e0ff", font=("SF Pro Display", 12))
+        self._toggle_btn = tk.Button(
+            key_row, text="Show", bg=ENTRY_BG, fg=MUTED, bd=0, cursor="hand2",
+            font=("SF Pro Display", 10), activebackground=ENTRY_BG, activeforeground=ACCENT,
+            command=self._toggle_key_visibility, padx=6,
+        )
+        self._toggle_btn.pack(side="right")
+
+        # Context row
+        self._build_label(cfg_frame, "Call Context  (optional — injected as system prompt)")
+        self._ctx_text = tk.Text(
+            cfg_frame, height=5, bg=ENTRY_BG, fg=ENTRY_FG, insertbackground=ACCENT,
+            relief="flat", font=("SF Pro Display", 11), bd=0, wrap="word",
+            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
+        )
+        self._ctx_text.insert("1.0", self._cfg.get("context", ""))
+        self._ctx_text.pack(fill="x", pady=(2, 6), ipady=4)
+        self._ctx_text.bind("<KeyRelease>", self._autosave)
+
+        # Device row
+        self._build_label(cfg_frame, "Audio Input Device")
+        self._devices = list_input_devices()
+        device_names  = [f"[{i}] {n}" for i, n in self._devices]
+
+        self._device_var = tk.StringVar()
+        saved_idx = self._cfg.get("device_index", "")
+        if saved_idx != "" and self._devices:
+            try:
+                saved_idx_int = int(saved_idx)
+                matches = [d for d in self._devices if d[0] == saved_idx_int]
+                if matches:
+                    self._device_var.set(f"[{matches[0][0]}] {matches[0][1]}")
+            except (ValueError, IndexError):
+                pass
+        if not self._device_var.get() and device_names:
+            self._device_var.set(device_names[0])
+
+        device_menu = ttk.Combobox(
+            cfg_frame, textvariable=self._device_var,
+            values=device_names, state="readonly",
+            font=("SF Pro Display", 11),
+        )
+        device_menu.pack(fill="x", pady=(2, 10))
+        device_menu.bind("<<ComboboxSelected>>", self._autosave)
+
+        # Style combobox
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("TCombobox",
+                        fieldbackground=ENTRY_BG, background=ENTRY_BG,
+                        foreground=ENTRY_FG, selectbackground=ENTRY_BG,
+                        selectforeground=ENTRY_FG, arrowcolor=ACCENT,
+                        borderwidth=0)
+
+        # Start/Stop button
+        self._start_btn = tk.Button(
+            cfg_frame, text="🎤  Start Listening",
+            bg=GREEN, fg="white", bd=0, cursor="hand2",
+            font=("SF Pro Display", 13, "bold"), relief="flat",
+            activebackground="#2aa050", activeforeground="white",
+            command=self._toggle_session, pady=7,
+        )
+        self._start_btn.pack(fill="x", pady=(0, 10))
+
+        # ── Divider ───────────────────────────────────────────────────────────
+        tk.Frame(root, bg=BORDER, height=1).pack(fill="x", padx=0)
+
+        # ── Suggestions feed ──────────────────────────────────────────────────
+        feed_header = tk.Frame(root, bg=BG)
+        feed_header.pack(fill="x", padx=12, pady=(6, 2))
+        tk.Label(feed_header, text="Suggestions", bg=BG, fg=MUTED,
+                 font=("SF Pro Display", 10, "bold")).pack(side="left")
+        tk.Button(feed_header, text="Clear", bg=BG, fg=MUTED, bd=0, cursor="hand2",
+                  font=("SF Pro Display", 9), activebackground=BG, activeforeground=ACCENT,
+                  command=self._clear_feed).pack(side="right")
+
+        feed_frame = tk.Frame(root, bg=BG)
+        feed_frame.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+
+        self._feed = tk.Text(
+            feed_frame, bg=BG, fg=BODY_FG,
+            font=("SF Pro Display", 12), wrap="word", bd=0,
+            highlightthickness=0, state="disabled", cursor="arrow",
+        )
+        self._feed.tag_configure("bullet", foreground=BULLET_FG, font=("SF Pro Display", 12, "bold"))
+        self._feed.tag_configure("body",   foreground=BODY_FG,   font=("SF Pro Display", 12))
+
+        scroll = tk.Scrollbar(feed_frame, command=self._feed.yview, bg=BG,
+                              troughcolor=BG, activebackground=ACCENT)
+        self._feed.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self._feed.pack(side="left", fill="both", expand=True)
+
+        # ── Status bar ────────────────────────────────────────────────────────
+        self._status_var = tk.StringVar(value="Ready")
+        tk.Label(root, textvariable=self._status_var, bg=BAR_BG, fg=MUTED,
+                 font=("SF Pro Display", 10), anchor="w",
+                 padx=10, pady=4).pack(fill="x", side="bottom")
 
         self._ready.set()
-        self._root.after(100, self._poll_queue)
-        self._root.mainloop()
+        root.after(100, self._poll_queue)
+        root.after(4000, self._check_screenshare)
+        root.mainloop()
 
-    def _poll_queue(self):
-        """Pull pending UI updates from queue — runs on tkinter thread."""
-        try:
-            while True:
-                cmd, arg = self._queue.get_nowait()
-                if cmd == "text":
-                    self._append_text(arg)
-                elif cmd == "status":
-                    if self._status_var:
-                        self._status_var.set(arg)
-                elif cmd == "clear":
-                    self._clear()
-                elif cmd == "hide":
-                    self._root.withdraw()
-                elif cmd == "show":
-                    self._root.deiconify()
-        except queue.Empty:
-            pass
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _build_label(self, parent, text):
+        tk.Label(parent, text=text, bg=BG, fg=MUTED,
+                 font=("SF Pro Display", 10)).pack(anchor="w", pady=(0, 1))
+
+    def _drag_start(self, e):
+        self._drag_x = e.x_root - self._root.winfo_x()
+        self._drag_y = e.y_root - self._root.winfo_y()
+
+    def _drag_motion(self, e):
+        self._root.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
+
+    def _drag_end(self, e):
+        self._cfg["win_x"] = str(self._root.winfo_x())
+        self._cfg["win_y"] = str(self._root.winfo_y())
+        save_config(self._cfg)
+
+    def _hide(self):
         if self._root:
-            self._root.after(100, self._poll_queue)
+            self._root.withdraw()
+
+    def show(self):
+        self._ui_queue.put(("show", None))
+
+    def _toggle_key_visibility(self):
+        self._key_visible = not self._key_visible
+        self._key_entry.config(show="" if self._key_visible else "●")
+        self._toggle_btn.config(text="Hide" if self._key_visible else "Show")
+
+    def _autosave(self, _event=None):
+        self._cfg["api_key"]      = self._api_var.get().strip()
+        self._cfg["context"]      = self._ctx_text.get("1.0", "end-1c")
+        device_str = self._device_var.get()
+        if device_str.startswith("["):
+            try:
+                idx = int(device_str.split("]")[0][1:])
+                self._cfg["device_index"] = str(idx)
+            except (ValueError, IndexError):
+                pass
+        save_config(self._cfg)
+
+    def _get_device_index(self) -> Optional[int]:
+        device_str = self._device_var.get()
+        if device_str.startswith("["):
+            try:
+                return int(device_str.split("]")[0][1:])
+            except (ValueError, IndexError):
+                pass
+        return None
+
+    # ── Session control ───────────────────────────────────────────────────────
+    def _toggle_session(self):
+        if self._active:
+            self._stop_session()
+        else:
+            self._start_session()
+
+    def _start_session(self):
+        api_key = self._api_var.get().strip()
+        if not api_key:
+            self._set_status("⚠️  Enter API key first")
+            return
+        context = self._ctx_text.get("1.0", "end-1c")
+        device_idx = self._get_device_index()
+
+        self._client = GeminiLiveClient(
+            api_key=api_key,
+            context=context,
+            on_text=self._on_text,
+            on_status=self._set_status,
+            on_error=self._on_error,
+        )
+        self._client.start()
+        self._audio = AudioCapture(device_idx, self._client)
+        self._audio.start()
+        self._active = True
+        self._start_btn.config(text="⏹  Stop", bg=RED, activebackground="#b03030")
+        self.app.set_menu_bar_icon(active=True)
+        self._autosave()
+
+    def _stop_session(self):
+        if self._client:
+            self._client.stop()
+        if self._audio:
+            self._audio.stop()
+        self._client = None
+        self._audio  = None
+        self._active = False
+        self._start_btn.config(text="🎤  Start Listening", bg=GREEN, activebackground="#2aa050")
+        self._set_status("Stopped")
+        self.app.set_menu_bar_icon(active=False)
+
+    # ── Feed ──────────────────────────────────────────────────────────────────
+    def _on_text(self, text: str):
+        self._ui_queue.put(("text", text))
+
+    def _on_error(self, msg: str):
+        self._ui_queue.put(("status", f"⚠️  {msg}"))
+
+    def _set_status(self, msg: str):
+        self._ui_queue.put(("status", msg))
 
     def _append_text(self, text: str):
-        if not self._text:
-            return
-        self._text.configure(state="normal")
+        self._feed.configure(state="normal")
         for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
             if line.startswith("•"):
-                self._text.insert("end", "• ", "bullet")
-                self._text.insert("end", line[1:].strip() + "\n", "body")
+                self._feed.insert("end", "• ", "bullet")
+                self._feed.insert("end", line[1:].strip() + "\n", "body")
             else:
-                self._text.insert("end", line + "\n", "body")
-        self._text.see("end")
-        self._text.configure(state="disabled")
+                self._feed.insert("end", line + "\n", "body")
+        self._feed.see("end")
+        self._feed.configure(state="disabled")
 
-    def _clear(self):
-        if self._text:
-            self._text.configure(state="normal")
-            self._text.delete("1.0", "end")
-            self._text.configure(state="disabled")
+    def _clear_feed(self):
+        self._feed.configure(state="normal")
+        self._feed.delete("1.0", "end")
+        self._feed.configure(state="disabled")
 
-    def hide(self):
-        self._queue.put(("hide", None))
+    # ── Queue poll (runs on tkinter thread) ───────────────────────────────────
+    def _poll_queue(self):
+        try:
+            while True:
+                cmd, arg = self._ui_queue.get_nowait()
+                if cmd == "text":
+                    self._append_text(arg)
+                elif cmd == "status":
+                    if self._status_var:
+                        self._status_var.set(arg)
+                elif cmd == "show":
+                    self._root.deiconify()
+                    self._root.lift()
+                    self._root.wm_attributes("-topmost", True)
+        except queue.Empty:
+            pass
+        if self._root:
+            self._root.after(100, self._poll_queue)
 
-    def show_panel(self):
-        self._queue.put(("show", None))
-
-    def set_status(self, msg: str):
-        self._queue.put(("status", msg))
-
-    def add_text(self, text: str):
-        self._queue.put(("text", text))
-
-    def clear(self):
-        self._queue.put(("clear", None))
-
-    def _drag_start(self, event):
-        self._drag_x = event.x_root - self._root.winfo_x()
-        self._drag_y = event.y_root - self._root.winfo_y()
-
-    def _drag_motion(self, event):
-        x = event.x_root - self._drag_x
-        y = event.y_root - self._drag_y
-        self._root.geometry(f"+{x}+{y}")
-
-
-# ── Settings dialog (tkinter) ─────────────────────────────────────────────────
-def open_settings_dialog(cfg: dict, devices: list[tuple[int, str]], on_save):
-    """Blocking settings window — run in a thread."""
-    root = tk.Tk()
-    root.title("Call Copilot — Settings")
-    root.configure(bg="#0a0a14")
-    root.resizable(False, False)
-    root.geometry("400x300")
-    root.wm_attributes("-topmost", True)
-
-    pad = {"padx": 16, "pady": 6}
-
-    tk.Label(root, text="Gemini API Key", bg="#0a0a14", fg="#a0a0ff",
-             font=("SF Pro Display", 11)).pack(anchor="w", **pad)
-    api_var = tk.StringVar(value=cfg.get("api_key", ""))
-    api_entry = tk.Entry(root, textvariable=api_var, show="•", width=42,
-                         bg="#16162a", fg="#e0e0ff", insertbackground="#e0e0ff",
-                         font=("SF Pro Display", 11), bd=0, highlightthickness=1,
-                         highlightcolor="#4a9eff")
-    api_entry.pack(anchor="w", padx=16)
-
-    tk.Label(root, text="Audio Input Device", bg="#0a0a14", fg="#a0a0ff",
-             font=("SF Pro Display", 11)).pack(anchor="w", **pad)
-
-    device_names = [f"{i}: {name}" for i, name in devices]
-    device_var = tk.StringVar()
-    saved_idx = cfg.get("device_index", "")
-    if saved_idx:
-        match = next((n for n in device_names if n.startswith(f"{saved_idx}:")), None)
-        if match:
-            device_var.set(match)
-    if not device_var.get() and device_names:
-        device_var.set(device_names[0])
-
-    device_menu = tk.OptionMenu(root, device_var, *device_names)
-    device_menu.configure(bg="#16162a", fg="#e0e0ff", activebackground="#4a9eff",
-                          font=("SF Pro Display", 11), bd=0, highlightthickness=0)
-    device_menu["menu"].configure(bg="#16162a", fg="#e0e0ff")
-    device_menu.pack(anchor="w", padx=16)
-
-    def save():
-        selected = device_var.get()
-        idx = selected.split(":")[0].strip() if selected else ""
-        new_cfg = {"api_key": api_var.get().strip(), "device_index": idx}
-        save_config(new_cfg)
-        on_save(new_cfg)
-        root.destroy()
-
-    tk.Button(root, text="Save & Close", command=save,
-              bg="#4a9eff", fg="#0a0a14", font=("SF Pro Display", 11, "bold"),
-              bd=0, padx=16, pady=6, cursor="hand2").pack(pady=20)
-
-    root.mainloop()
+    # ── Screenshare auto-hide ─────────────────────────────────────────────────
+    def _check_screenshare(self):
+        if not self._root:
+            return
+        try:
+            if is_screensharing():
+                self._root.withdraw()
+            else:
+                self._root.deiconify()
+        except Exception:
+            pass
+        self._root.after(4000, self._check_screenshare)
 
 
-# ── Menu bar app ───────────────────────────────────────────────────────────────
+# ── rumps menu bar app ─────────────────────────────────────────────────────────
 class CallCopilotApp(rumps.App):
     def __init__(self):
         super().__init__("🎤", quit_button=None)
-
-        self.cfg     = load_config()
-        self.devices = list_input_devices()
-        self.panel   = SuggestionsPanel()
-        self.panel.show()
-
-        self.gemini: Optional[GeminiLiveClient] = None
-        self.capture: Optional[AudioCapture]    = None
-        self._session_active = False
-
-        # Context field shown in menu
-        self._context_item = rumps.MenuItem("Context: (paste before session)", callback=None)
-
         self.menu = [
-            rumps.MenuItem("Start Session",   callback=self.start_session),
-            rumps.MenuItem("End Session",     callback=self.end_session),
-            rumps.separator,
-            rumps.MenuItem("Set Context…",    callback=self.set_context),
-            rumps.MenuItem("Settings…",       callback=self.open_settings),
-            rumps.separator,
-            rumps.MenuItem("Quit",            callback=rumps.quit_application),
+            rumps.MenuItem("Show / Hide", callback=self._toggle_window),
+            None,
+            rumps.MenuItem("Quit Call Copilot", callback=self._quit),
         ]
-        self._context = ""
+        self._window: Optional[CopilotWindow] = None
 
-    # ── Context ───────────────────────────────────────────────────────────────
-    @rumps.clicked("Set Context…")
-    def set_context(self, _):
-        resp = rumps.Window(
-            title="Set Call Context",
-            message="Paste agenda, notes, or context for this call:",
-            default_text=self._context,
-            dimensions=(380, 120),
-        ).run()
-        if resp.clicked:
-            self._context = resp.text.strip()
+    def set_menu_bar_icon(self, active: bool):
+        self.title = "🔴" if active else "🎤"
 
-    # ── Settings ──────────────────────────────────────────────────────────────
-    @rumps.clicked("Settings…")
-    def open_settings(self, _):
-        def on_save(new_cfg):
-            self.cfg = new_cfg
-        t = threading.Thread(
-            target=open_settings_dialog,
-            args=(self.cfg, self.devices, on_save),
-            daemon=True,
-        )
-        t.start()
+    @rumps.clicked("Show / Hide")
+    def _toggle_window(self, _=None):
+        if self._window:
+            self._window.show()
 
-    # ── Session management ────────────────────────────────────────────────────
-    @rumps.clicked("Start Session")
-    def start_session(self, _):
-        if self._session_active:
-            rumps.alert("Session already running.")
-            return
+    @rumps.clicked("Quit Call Copilot")
+    def _quit(self, _=None):
+        if self._window and self._window._active:
+            self._window._stop_session()
+        rumps.quit_application()
 
-        api_key = self.cfg.get("api_key", "").strip()
-        if not api_key:
-            rumps.alert("No API key set. Open Settings… first.")
-            return
-
-        device_idx_str = self.cfg.get("device_index", "").strip()
-        device_idx = int(device_idx_str) if device_idx_str.isdigit() else None
-
-        self.panel.clear()
-        self.panel.show_panel()
-
-        self.gemini = GeminiLiveClient(
-            api_key   = api_key,
-            context   = self._context,
-            on_text   = self.panel.add_text,
-            on_status = self.panel.set_status,
-            on_error  = lambda e: self.panel.set_status(f"Error: {e}"),
-        )
-        self.gemini.start()
-
-        self.capture = AudioCapture(device_idx, self.gemini)
-        self.capture.start()
-
-        self._session_active = True
-        self.title = "🔴"
-
-    @rumps.clicked("End Session")
-    def end_session(self, _):
-        if not self._session_active:
-            return
-        if self.capture:
-            self.capture.stop()
-        if self.gemini:
-            self.gemini.stop()
-        self._session_active = False
-        self.title = "🎤"
-        self.panel.set_status("Session ended.")
+    def run_with_window(self):
+        self._window = CopilotWindow(app_ref=self)
+        self._window.launch()
+        self.run()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-def main():
-    app = CallCopilotApp()
-    app.run()
-
-
+# ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    app = CallCopilotApp()
+    app.run_with_window()
