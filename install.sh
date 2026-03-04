@@ -43,7 +43,7 @@ mkdir -p "$BIN_DIR"
 cat > "$BIN_DIR/call-copilot" << 'LAUNCHEREOF'
 #!/usr/bin/env bash
 cd "$HOME/.call-copilot"
-"$HOME/.call-copilot/.venv/bin/python" main.py "$@"
+exec "$HOME/.call-copilot/.venv/bin/python" main.py "$@"
 LAUNCHEREOF
 chmod +x "$BIN_DIR/call-copilot"
 
@@ -55,6 +55,9 @@ fi
 
 echo ""
 echo "✓ Installed. Usage:"
-echo "  1. brew install blackhole-2ch       (one-time: audio loopback)"
-echo "  2. call-copilot"
+echo ""
+echo "  brew install blackhole-2ch       (one-time: audio loopback)"
+echo "  Set GEMINI_API_KEY in Settings… after first launch"
+echo "  call-copilot"
+echo ""
 echo "  The 🎤 icon will appear in your menu bar."
