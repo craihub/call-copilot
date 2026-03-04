@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install PortAudio (required by PyAudio)
+      - name: Install PortAudio
         run: brew install portaudio
 
       - name: Install Python deps + PyInstaller
@@ -31,9 +31,7 @@ jobs:
           pyinstaller \
             --name "CallCopilot" \
             --windowed \
-            --onefile \
-            --icon NONE \
-            --add-data "README.md:." \
+            --onedir \
             --hidden-import PyQt6.sip \
             --hidden-import PyQt6.QtCore \
             --hidden-import PyQt6.QtGui \
@@ -63,5 +61,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CallCopilot-app-raw
-          path: dist/CallCopilot
+          path: dist/CallCopilot.app
           retention-days: 14
