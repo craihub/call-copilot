@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 REPO="https://github.com/craihub/call-copilot.git"
 INSTALL_DIR="$HOME/.call-copilot"
@@ -13,10 +13,9 @@ if ! command -v brew &>/dev/null; then
   exit 1
 fi
 
-# Install python@3.11 + tk support + portaudio
-echo "→ Installing python@3.11 + tk support + portaudio..."
-brew install python@3.11 portaudio 2>/dev/null || true
-brew install python-tk@3.11 2>/dev/null || true
+# Install deps — python@3.11 includes tkinter when tcl-tk is present
+echo "→ Installing dependencies..."
+brew install python@3.11 tcl-tk@8 portaudio 2>/dev/null || true
 
 # Locate python3.11
 PYTHON="$(brew --prefix)/bin/python3.11"
@@ -37,7 +36,7 @@ else
 fi
 
 # Create virtualenv and install dependencies
-echo "→ Creating virtualenv with python@3.11..."
+echo "→ Creating virtualenv..."
 VENV_DIR="$INSTALL_DIR/.venv"
 "$PYTHON" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --upgrade pip -q
