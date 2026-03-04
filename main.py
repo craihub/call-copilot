@@ -53,7 +53,7 @@ CHUNK_SIZE     = 512
 AUDIO_MIME     = "audio/pcm;rate=16000"
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
-MODEL       = "gemini-2.5-flash-exp"
+MODEL       = "gemini-live-2.5-flash-native-audio"
 WS_URI_TMPL = (
     "wss://generativelanguage.googleapis.com/ws/"
     "google.ai.generativelanguage.v1beta"
