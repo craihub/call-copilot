@@ -24,7 +24,7 @@ jobs:
       - name: Install Python deps + PyInstaller
         run: |
           pip install --upgrade pip
-          pip install pyaudio PyQt6 websockets pyinstaller
+          pip install pyaudio rumps websockets pyinstaller
 
       - name: Build .app with PyInstaller
         run: |
@@ -32,10 +32,9 @@ jobs:
             --name "CallCopilot" \
             --windowed \
             --onedir \
-            --hidden-import PyQt6.sip \
-            --hidden-import PyQt6.QtCore \
-            --hidden-import PyQt6.QtGui \
-            --hidden-import PyQt6.QtWidgets \
+            --hidden-import rumps \
+            --hidden-import pyaudio \
+            --hidden-import websockets \
             main.py
 
       - name: Package as DMG
