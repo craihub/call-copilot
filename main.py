@@ -56,7 +56,7 @@ AUDIO_MIME     = "audio/pcm;rate=16000"
 MODEL       = "gemini-2.0-flash-exp"
 WS_URI_TMPL = (
     "wss://generativelanguage.googleapis.com/ws/"
-    "google.ai.generativelanguage.v1beta"
+    "google.ai.generativelanguage.v1alpha"
     ".GenerativeService.BidiGenerateContent?key={api_key}"
 )
 
