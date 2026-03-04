@@ -1,52 +1,51 @@
 #!/usr/bin/env bash
+# Call Copilot — installer for macOS 12+
 set -e
 
-REPO="https://github.com/craihub/call-copilot.git"
 INSTALL_DIR="$HOME/.call-copilot"
-VENV_DIR="$INSTALL_DIR/.venv"
 BIN_DIR="$HOME/.local/bin"
+REPO="https://raw.githubusercontent.com/craihub/call-copilot/main"
 
-echo "==> Installing Call Copilot…"
+echo "→ Installing Call Copilot..."
 
-# Dependencies
-if ! command -v brew &>/dev/null; then
-  echo "Homebrew not found. Install from https://brew.sh then re-run."
-  exit 1
-fi
-
-echo "==> Installing portaudio (required for PyAudio)…"
-brew install portaudio 2>/dev/null || true
-
-echo "==> Cloning repo…"
-if [ -d "$INSTALL_DIR/.git" ]; then
-  git -C "$INSTALL_DIR" pull --ff-only
-else
-  git clone "$REPO" "$INSTALL_DIR"
-fi
-
-echo "==> Creating virtualenv…"
-python3 -m venv "$VENV_DIR"
-"$VENV_DIR/bin/pip" install --upgrade pip -q
-"$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q
-
-echo "==> Creating launcher…"
+# Ensure bin dir exists and is on PATH
 mkdir -p "$BIN_DIR"
-cat > "$BIN_DIR/call-copilot" <<EOF
+if ! echo "$PATH" | grep -q "$BIN_DIR"; then
+  echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> "$HOME/.zshrc"
+  export PATH="$BIN_DIR:$PATH"
+fi
+
+# Create install dir
+mkdir -p "$INSTALL_DIR"
+
+# Download main.py and requirements.txt
+curl -fsSL "$REPO/main.py"           -o "$INSTALL_DIR/main.py"
+curl -fsSL "$REPO/requirements.txt"  -o "$INSTALL_DIR/requirements.txt"
+
+# Set up Python venv
+python3 -m venv "$INSTALL_DIR/venv"
+"$INSTALL_DIR/venv/bin/pip" install -q --upgrade pip
+"$INSTALL_DIR/venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
+
+# Install PortAudio if not present (required by pyaudio)
+if ! brew list portaudio &>/dev/null 2>&1; then
+  echo "→ Installing PortAudio via Homebrew..."
+  brew install portaudio
+fi
+
+# Write launcher script
+cat > "$BIN_DIR/call-copilot" << 'EOF'
 #!/usr/bin/env bash
-cd "$INSTALL_DIR"
-export GEMINI_API_KEY="\${GEMINI_API_KEY:-}"
-"$VENV_DIR/bin/python" main.py "\$@"
+exec "$HOME/.call-copilot/venv/bin/python" "$HOME/.call-copilot/main.py" "$@"
 EOF
 chmod +x "$BIN_DIR/call-copilot"
 
-# Ensure ~/.local/bin is in PATH
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-  echo ""
-  echo "  Add to your shell config (~/.zshrc or ~/.bash_profile):"
-  echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
-fi
-
 echo ""
-echo "==> Done! Run with:"
-echo "    GEMINI_API_KEY=your_key call-copilot"
-echo "    # or set GEMINI_API_KEY in your environment and just run: call-copilot"
+echo "✓ Installed. Usage:"
+echo ""
+echo "  1. brew install blackhole-2ch       (one-time: audio loopback)"
+echo "  2. Set GEMINI_API_KEY in Settings… after first launch"
+echo "  3. call-copilot"
+echo ""
+echo "  The 🎤 icon will appear in your menu bar."
+echo ""

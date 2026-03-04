@@ -1,58 +1,68 @@
 # Call Copilot
 
-Real-time call assistant powered by Gemini Live API. Streams system audio → WebSocket → instant bullet-point suggestions in an always-on-top overlay.
+Real-time AI call assistant that lives in your macOS menu bar.
 
-## Quick Install (macOS)
+Streams system audio to Gemini Live API and surfaces bullet-point answers in a floating panel — without covering your screen.
+
+**Compatible with macOS 12+ (Monterey and later).**
+
+---
+
+## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/craihub/call-copilot/main/install.sh | bash
 ```
 
-## Manual Setup
+---
 
-```bash
-git clone https://github.com/craihub/call-copilot.git
-cd call-copilot
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-GEMINI_API_KEY=your_key_here python main.py
-```
+## Setup
 
-## macOS Audio Loopback
-
-To capture system audio (the remote caller's voice), install [BlackHole](https://github.com/ExistentialAudio/BlackHole):
+### 1. Audio loopback (one-time)
 
 ```bash
 brew install blackhole-2ch
 ```
 
-Then in **System Settings → Sound → Input**, select **BlackHole 2ch** as your input device. In the app, enter the BlackHole device index (shown in the device list at the bottom of the overlay).
+In **System Settings → Sound → Output**: create a Multi-Output Device that includes both BlackHole 2ch and your speakers.
+Set it as your system output. BlackHole will mirror everything to Call Copilot.
 
-For a multi-output device (hear AND capture): Open **Audio MIDI Setup**, create a Multi-Output Device combining your speakers + BlackHole.
+### 2. API Key
+
+Get a Gemini API key from [aistudio.google.com](https://aistudio.google.com).
+
+After launching, click **🎤 → Settings…** and paste your key. It's saved to `~/.call-copilot/config`.
+
+---
 
 ## Usage
 
-1. Launch the app
-2. Paste your Gemini API key (or set `GEMINI_API_KEY` env var)
-3. Enter call context (e.g. "Interview for Senior Dev role")
-4. Select audio input device index (blank = default mic)
-5. Click **▶ Start Listening**
-6. The overlay stays on top — bullet suggestions appear as the AI hears questions
+```bash
+call-copilot
+```
+
+A **🎤** icon appears in your menu bar.
+
+| Menu item | Action |
+|---|---|
+| Set Context… | Paste call agenda or notes before starting |
+| Start Session | Connects to Gemini, starts listening |
+| End Session | Stops capture and disconnects |
+| Settings… | API key + audio device picker |
+
+When a session is active the icon turns **🔴** and a floating panel shows AI bullet points in real time.
+
+---
 
 ## Requirements
 
-- macOS 12+
+- macOS 12+ (Monterey or later)
 - Python 3.10+
+- Homebrew (for PortAudio + BlackHole)
 - Gemini API key with Live API access
-- PortAudio (`brew install portaudio`)
+
+---
 
 ## Model
 
-Uses `gemini-2.5-flash-exp` via Multimodal Live API (WebSockets) — native audio understanding, no STT step.
-
-**Latency optimizations:**
-- 512-sample chunks (~32ms) streamed directly as PCM
-- Server-side VAD with 500ms silence trigger
-- TEXT-only response modality (no audio synthesis)
-- Temperature 0.2 for fast, focused responses
+Uses `gemini-2.5-flash-exp` via the Gemini Multimodal Live API (native audio streaming, no STT step).
