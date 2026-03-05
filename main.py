@@ -147,7 +147,7 @@ class GeminiLiveClient:
             "setup": {
                 "model": f"models/{MODEL}",
                 "generation_config": {
-                    "response_modalities": ["TEXT"],
+                    "response_modalities": ["AUDIO"],
                     "temperature": 0.2,
                 },
                 "system_instruction": {"parts": [{"text": instruction}]},
