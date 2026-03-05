@@ -2,8 +2,7 @@
 """
 Real-Time Call Copilot
 Single floating window: API key + context + device + start/stop + scrollable bullets.
-System tray icon. Auto-hides when screensharing. macOS 12+ compatible.
-Built with PyQt6 — no tkinter, no rumps.
+Menu bar icon. Auto-hides when screensharing. macOS 12+ compatible.
 """
 
 import asyncio
@@ -12,38 +11,29 @@ import json
 import os
 import queue
 import subprocess
-import sys
 import threading
+import time
+import tkinter as tk
 from pathlib import Path
+from tkinter import ttk
 from typing import Optional
 
-import logging
 import pyaudio
+import rumps
 import websockets
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-LOG_FILE = Path.home() / ".call-copilot" / "copilot.log"
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, mode="a"),
-        logging.StreamHandler(sys.stderr),
-    ],
-)
-log = logging.getLogger("copilot")
-from PyQt6.QtCore import Qt, QPoint, pyqtSignal, QObject, QTimer
-from PyQt6.QtGui import QIcon, QFont, QColor, QPalette, QAction, QPixmap, QPainter
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QComboBox, QPushButton, QTextEdit, QFrame,
-    QSystemTrayIcon, QMenu, QSizePolicy,
-)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG_DIR  = Path.home() / ".call-copilot"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+LOG_FILE    = CONFIG_DIR / "copilot.log"
 CONFIG_DIR.mkdir(exist_ok=True)
+
+def log(msg: str):
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
 AUDIO_RATE     = 16000
@@ -53,30 +43,42 @@ CHUNK_SIZE     = 512
 AUDIO_MIME     = "audio/pcm;rate=16000"
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
-MODEL       = "gemini-2.5-flash-native-audio-preview-12-2025"
+MODEL       = "gemini-2.0-flash-live-001"
 WS_URI_TMPL = (
     "wss://generativelanguage.googleapis.com/ws/"
     "google.ai.generativelanguage.v1alpha"
     ".GenerativeService.BidiGenerateContent?key={api_key}"
 )
 
-SYSTEM_PROMPT = (
-    "You are a real-time call copilot displayed on a tiny screen. "
-    "ABSOLUTE RULES — violating any rule is a critical failure:\n"
-    "1. ONLY output bullet points. Never output a sentence, paragraph, or explanation.\n"
-    "2. Each bullet starts with • and is MAX 10 words.\n"
-    "3. Max 3 bullets per response. Fewer is better.\n"
-    "4. No greetings, no intros, no 'Here are some suggestions', no filler.\n"
-    "5. If nobody asked a question, output NOTHING. Silence is correct.\n"
-    "6. Use the call context to make bullets hyper-relevant.\n"
-    "7. Write at a glance-reading level — the user is mid-conversation and has 1 second to read.\n\n"
-    "GOOD example:\n"
-    "• Budget was $50K last quarter\n"
-    "• Push for Q2 close — they mentioned deadline\n"
-    "• Ask about competing bids\n\n"
-    "BAD example (NEVER do this):\n"
-    "Based on the context of your call, here are some suggestions you might consider..."
-)
+SYSTEM_PROMPT = """\
+You are a real-time call copilot whispering answers into the user's ear.
+
+CRITICAL RULES — violating ANY of these is a failure:
+
+1. OUTPUT FORMAT: Only bullet points. Every line starts with •
+2. BULLET LENGTH: Max 12 words per bullet. No exceptions.
+3. BULLET COUNT: 1-4 bullets per response. Never more.
+4. NO META-COMMENTARY: Never say "analyzing", "processing", "let me think".
+   Give the ANSWER, not a description of what you're doing.
+5. NO INTROS: No "Here's what I found" or "Based on the context". Just bullets.
+6. NO FILLER: No "Great question!" or "That's interesting". Just answer.
+7. SILENCE: If nobody is asking a question, output absolutely nothing.
+8. ONLY RESPOND TO OTHER SPEAKERS: The user is wearing an earpiece. You hear
+   TWO voices — the user and the other caller. Only respond when the OTHER
+   person (not the user) asks a question or says something that needs a response.
+   When the user speaks, stay silent — they don't need help with their own words.
+
+GOOD examples:
+  • Germany invaded Poland September 1, 1939
+  • Treaty of Versailles created economic resentment
+  • Britain and France declared war September 3
+
+BAD examples (NEVER do this):
+  • Analyzing the start of WWII
+  • Let me break that down for you
+  • That's a great question about history
+
+{context_block}"""
 
 # ── Colors ─────────────────────────────────────────────────────────────────────
 BG          = "#0b0d1a"
@@ -89,6 +91,9 @@ GREEN       = "#38c060"
 ENTRY_BG    = "#181c34"
 ENTRY_FG    = "#b0bce0"
 BORDER      = "#2a2e50"
+BULLET_FG   = "#4a8fff"
+BODY_FG     = "#e8ecff"
+CARD_BG     = "#151830"
 
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
@@ -121,20 +126,32 @@ def list_input_devices() -> list:
 
 # ── Screenshare detection ──────────────────────────────────────────────────────
 def is_screensharing() -> bool:
+    """Detect macOS screenshare via multiple methods."""
+    checks = [
+        ["pgrep", "-x", "screencaptureui"],
+        ["pgrep", "-x", "ScreenSharingAgent"],
+    ]
+    for cmd in checks:
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+            if out.strip():
+                return True
+        except subprocess.CalledProcessError:
+            pass
+
+    # Check CGSession for screen recording indicator
     try:
         out = subprocess.check_output(
-            ["pgrep", "-x", "-l", "screencaptureuiagent"], stderr=subprocess.DEVNULL
+            ["bash", "-c",
+             "system_profiler SPDisplaysDataType 2>/dev/null | grep -i 'screen sharing'"],
+            stderr=subprocess.DEVNULL
         )
-        return bool(out.strip())
+        if out.strip():
+            return True
     except subprocess.CalledProcessError:
         pass
-    try:
-        out = subprocess.check_output(
-            ["pgrep", "-f", "screensharing"], stderr=subprocess.DEVNULL
-        )
-        return bool(out.strip())
-    except subprocess.CalledProcessError:
-        return False
+
+    return False
 
 
 # ── Gemini Live WebSocket client ───────────────────────────────────────────────
@@ -150,9 +167,12 @@ class GeminiLiveClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def build_setup(self) -> dict:
-        instruction = SYSTEM_PROMPT
+        ctx_block = ""
         if self.context.strip():
-            instruction += f"\n\nCall context: {self.context.strip()}"
+            ctx_block = f"CALL CONTEXT (use this to tailor answers):\n{self.context.strip()}"
+
+        instruction = SYSTEM_PROMPT.format(context_block=ctx_block)
+
         return {
             "setup": {
                 "model": f"models/{MODEL}",
@@ -175,21 +195,16 @@ class GeminiLiveClient:
 
     def start(self):
         self._loop = asyncio.new_event_loop()
-        log.info("Starting Gemini client thread")
         threading.Thread(target=self._run_loop, daemon=True).start()
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._connect())
-        except Exception as e:
-            log.exception("Event loop crashed")
-            self.on_error(f"Connection failed: {e}")
+        self._loop.run_until_complete(self._connect())
 
     async def _connect(self):
         uri = WS_URI_TMPL.format(api_key=self.api_key)
-        self.on_status("Connecting...")
-        log.info("Connecting to %s", uri[:80] + "...")
+        self.on_status("Connecting…")
+        log(f"[WS] Connecting to {uri[:80]}...")
         try:
             async with websockets.connect(
                 uri,
@@ -200,31 +215,27 @@ class GeminiLiveClient:
             ) as ws:
                 self.running = True
                 setup_msg = self.build_setup()
-                log.debug("Sending setup: %s", json.dumps(setup_msg)[:200])
+                log(f"[WS] Sending setup: model={MODEL}")
                 await ws.send(json.dumps(setup_msg))
-                raw_resp = await ws.recv()
-                resp = json.loads(raw_resp)
-                log.debug("Setup response: %s", json.dumps(resp)[:500])
+                resp = json.loads(await ws.recv())
+                log(f"[WS] Setup response: {json.dumps(resp)[:200]}")
                 if "error" in resp:
-                    err_msg = str(resp["error"])
-                    log.error("Setup error from Gemini: %s", err_msg)
-                    self.on_error(err_msg)
+                    self.on_error(str(resp["error"]))
                     return
-                self.on_status("[LIVE] Listening...")
-                log.info("Connected and listening")
+                self.on_status("🟢 Connected — listening for other speaker")
+                log("[WS] Connected successfully, entering send/recv loops")
                 await asyncio.gather(self._send_loop(ws), self._recv_loop(ws))
         except websockets.exceptions.ConnectionClosedOK:
-            log.info("WebSocket closed normally")
             self.on_status("Disconnected")
+            log("[WS] Connection closed OK")
         except websockets.exceptions.ConnectionClosedError as e:
-            log.error("WebSocket closed with error: %s", e)
-            self.on_error(f"Connection lost: {e}")
+            self.on_error(f"Connection closed: {e.code} {e.reason}")
+            log(f"[WS] Connection closed error: {e.code} {e.reason}")
         except Exception as e:
-            log.exception("Connection error")
             self.on_error(f"Error: {e}")
+            log(f"[WS] Exception: {e}")
         finally:
             self.running = False
-            log.info("Gemini client stopped")
 
     async def _send_loop(self, ws):
         loop = asyncio.get_event_loop()
@@ -243,7 +254,8 @@ class GeminiLiveClient:
                 }))
             except queue.Empty:
                 continue
-            except Exception:
+            except Exception as e:
+                log(f"[SEND] Error: {e}")
                 break
 
     async def _recv_loop(self, ws):
@@ -252,15 +264,17 @@ class GeminiLiveClient:
                 break
             try:
                 data = json.loads(raw)
-                parts = (
-                    data.get("serverContent", {})
-                        .get("modelTurn", {})
-                        .get("parts", [])
-                )
+
+                # Extract text from model responses (ignore audio bytes)
+                server_content = data.get("serverContent", {})
+                parts = server_content.get("modelTurn", {}).get("parts", [])
                 for part in parts:
                     text = part.get("text", "").strip()
                     if text:
+                        log(f"[RECV] Text: {text[:100]}")
                         self.on_text(text)
+                    # Silently ignore inlineData (audio bytes)
+
             except json.JSONDecodeError:
                 pass
 
@@ -288,53 +302,27 @@ class AudioCapture(threading.Thread):
     def run(self):
         pa = pyaudio.PyAudio()
         try:
-            # Validate device exists in THIS PyAudio instance to avoid stale index segfault
-            dev_idx = self.device_index
-            if dev_idx is not None:
-                try:
-                    info = pa.get_device_info_by_index(dev_idx)
-                    log.info("Audio device %d: %s (channels=%d)", dev_idx, info.get("name"), info.get("maxInputChannels", 0))
-                    if info.get("maxInputChannels", 0) < 1:
-                        self.client.on_error(f"Device {dev_idx} has no input channels")
-                        return
-                except Exception as e:
-                    log.error("Invalid audio device %d: %s", dev_idx, e)
-                    self.client.on_error(f"Invalid audio device {dev_idx}: {e}")
-                    return
-            else:
-                # Fall back to default input device
-                try:
-                    default = pa.get_default_input_device_info()
-                    dev_idx = default["index"]
-                    log.info("Using default input device %d: %s", dev_idx, default.get("name"))
-                except Exception as e:
-                    log.error("No default input device: %s", e)
-                    self.client.on_error(f"No default input device: {e}")
-                    return
-
-            log.info("Opening audio stream: rate=%d, channels=%d, chunk=%d, device=%d", AUDIO_RATE, AUDIO_CHANNELS, CHUNK_SIZE, dev_idx)
+            log(f"[AUDIO] Opening device index={self.device_index}")
             stream = pa.open(
                 format=AUDIO_FORMAT,
                 channels=AUDIO_CHANNELS,
                 rate=AUDIO_RATE,
                 input=True,
-                input_device_index=dev_idx,
+                input_device_index=self.device_index,
                 frames_per_buffer=CHUNK_SIZE,
             )
-            log.info("Audio stream opened successfully")
+            log("[AUDIO] Capture started")
             while not self._stop_event.is_set():
                 try:
                     data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
                     self.client.push_audio(data)
-                except OSError as e:
-                    log.error("Audio read error: %s", e)
+                except OSError:
                     break
-            log.info("Audio capture loop ended")
             stream.stop_stream()
             stream.close()
+            log("[AUDIO] Capture stopped")
         except Exception as e:
-            log.exception("Audio capture error")
-            self.client.on_error(f"Audio error: {e}")
+            log(f"[AUDIO] Error: {e}")
         finally:
             pa.terminate()
 
@@ -342,416 +330,468 @@ class AudioCapture(threading.Thread):
         self._stop_event.set()
 
 
-# ── Signal bridge (thread-safe Qt updates) ─────────────────────────────────────
-class Signals(QObject):
-    text_received  = pyqtSignal(str)
-    status_changed = pyqtSignal(str)
-    error_occurred = pyqtSignal(str)
+# ── Main window (tkinter) ──────────────────────────────────────────────────────
+class CopilotWindow:
+    """Single floating window: config on top, bullets below."""
 
-
-# ── Main Window ────────────────────────────────────────────────────────────────
-class CopilotWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self._cfg = load_config()
+    def __init__(self, app_ref):
+        self.app        = app_ref
+        self._root: Optional[tk.Tk] = None
+        self._ready     = threading.Event()
+        self._ui_queue: queue.Queue = queue.Queue()
+        self._drag_x    = 0
+        self._drag_y    = 0
         self._client: Optional[GeminiLiveClient] = None
-        self._audio: Optional[AudioCapture] = None
-        self._active = False
-        self._drag_pos: Optional[QPoint] = None
+        self._audio: Optional[AudioCapture]       = None
+        self._active    = False
+        self._devices   = []
+        self._cfg       = load_config()
         self._key_visible = False
+        self._bullet_count = 0
+        self._max_bullets  = 30
 
-        self._signals = Signals()
-        self._signals.text_received.connect(self._append_bullet)
-        self._signals.status_changed.connect(self._set_status)
-        self._signals.error_occurred.connect(self._show_error)
+    def launch(self):
+        threading.Thread(target=self._run, daemon=True).start()
+        self._ready.wait(timeout=5)
 
-        self._setup_ui()
-        self._load_devices()
+    # ── Build UI ──────────────────────────────────────────────────────────────
+    def _run(self):
+        self._root = tk.Tk()
+        root = self._root
 
-        # Screenshare check timer
-        self._ss_timer = QTimer(self)
-        self._ss_timer.timeout.connect(self._check_screenshare)
-        self._ss_timer.start(3000)
+        root.title("Call Copilot")
+        root.configure(bg=BG)
+        root.overrideredirect(True)
+        root.wm_attributes("-topmost", True)
+        root.wm_attributes("-alpha", 0.95)
+        root.resizable(False, False)
 
-    def _setup_ui(self):
-        self.setWindowTitle("Call Copilot")
-        self.setFixedSize(440, 640)
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-
+        # Restore position
         x = int(self._cfg.get("win_x", 60))
         y = int(self._cfg.get("win_y", 60))
-        self.move(x, y)
+        root.geometry(f"440x640+{x}+{y}")
 
-        central = QWidget()
-        central.setStyleSheet(f"background-color: {BG};")
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        # ── Title bar ─────────────────────────────────────────────────────────
+        bar = tk.Frame(root, bg=BAR_BG, height=32)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        bar.bind("<ButtonPress-1>",  self._drag_start)
+        bar.bind("<B1-Motion>",      self._drag_motion)
+        bar.bind("<ButtonRelease-1>", self._drag_end)
 
-        # ── Title bar ──────────────────────────────────────────────────────────
-        bar = QFrame()
-        bar.setFixedHeight(32)
-        bar.setStyleSheet(f"background-color: {BAR_BG};")
-        bar_layout = QHBoxLayout(bar)
-        bar_layout.setContentsMargins(10, 0, 8, 0)
+        tk.Label(bar, text="🎤  Call Copilot", bg=BAR_BG, fg=ACCENT,
+                 font=("SF Pro Display", 12, "bold")).pack(side="left", padx=10, pady=4)
 
-        title = QLabel("Call Copilot")
-        title.setStyleSheet(f"color: {ACCENT}; font-size: 13px; font-weight: bold;")
-        bar_layout.addWidget(title)
-        bar_layout.addStretch()
+        close_btn = tk.Button(bar, text="✕", bg=BAR_BG, fg=MUTED, bd=0,
+                              font=("SF Pro Display", 12), cursor="hand2",
+                              activebackground=BAR_BG, activeforeground="#ff6060",
+                              command=self._hide)
+        close_btn.pack(side="right", padx=8)
 
-        close_btn = QPushButton("✕")
-        close_btn.setFixedSize(24, 24)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setStyleSheet(f"""
-            QPushButton {{
-                color: {MUTED}; background: transparent; border: none; font-size: 14px;
-            }}
-            QPushButton:hover {{ color: #ff6060; }}
-        """)
-        close_btn.clicked.connect(self.hide)
-        bar_layout.addWidget(close_btn)
-        layout.addWidget(bar)
+        # Minimize button (collapse config)
+        min_btn = tk.Button(bar, text="─", bg=BAR_BG, fg=MUTED, bd=0,
+                            font=("SF Pro Display", 12), cursor="hand2",
+                            activebackground=BAR_BG, activeforeground=ACCENT,
+                            command=self._toggle_config)
+        min_btn.pack(side="right", padx=2)
 
-        # ── Config section ─────────────────────────────────────────────────────
-        cfg_widget = QWidget()
-        cfg_widget.setStyleSheet(f"background-color: {BG};")
-        cfg_layout = QVBoxLayout(cfg_widget)
-        cfg_layout.setContentsMargins(12, 10, 12, 0)
-        cfg_layout.setSpacing(2)
+        # ── Config section (collapsible) ──────────────────────────────────────
+        self._cfg_frame = tk.Frame(root, bg=BG)
+        self._cfg_frame.pack(fill="x", padx=12, pady=(10, 0))
+        self._cfg_visible = True
 
-        entry_style = f"""
-            QLineEdit {{
-                background-color: {ENTRY_BG}; color: {ENTRY_FG}; border: 1px solid {BORDER};
-                border-radius: 4px; padding: 5px 8px; font-size: 12px;
-            }}
-            QLineEdit:focus {{ border-color: {ACCENT}; }}
-        """
-        label_style = f"color: {MUTED}; font-size: 10px; font-weight: bold;"
+        # API Key row
+        self._build_label(self._cfg_frame, "Gemini API Key")
+        key_row = tk.Frame(self._cfg_frame, bg=BG)
+        key_row.pack(fill="x", pady=(2, 6))
 
-        # API Key
-        cfg_layout.addWidget(self._make_label("GEMINI API KEY", label_style))
-        key_row = QHBoxLayout()
-        self._key_entry = QLineEdit(self._cfg.get("api_key", ""))
-        self._key_entry.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_entry.setPlaceholderText("Paste API key or set GEMINI_API_KEY env")
-        self._key_entry.setStyleSheet(entry_style)
-        key_row.addWidget(self._key_entry)
-
-        eye_btn = QPushButton("*")
-        eye_btn.setFixedSize(28, 28)
-        eye_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        eye_btn.setStyleSheet(f"QPushButton {{ background: transparent; border: none; font-size: 14px; }}")
-        eye_btn.clicked.connect(self._toggle_key_visibility)
-        key_row.addWidget(eye_btn)
-        cfg_layout.addLayout(key_row)
-
-        # Context
-        cfg_layout.addSpacing(4)
-        cfg_layout.addWidget(self._make_label("CALL CONTEXT", label_style))
-        self._context_entry = QLineEdit(self._cfg.get("context", ""))
-        self._context_entry.setPlaceholderText("e.g. Sales call with Acme Corp about Q3 renewal")
-        self._context_entry.setStyleSheet(entry_style)
-        cfg_layout.addWidget(self._context_entry)
-
-        # Audio device
-        cfg_layout.addSpacing(4)
-        cfg_layout.addWidget(self._make_label("AUDIO INPUT DEVICE", label_style))
-        self._device_combo = QComboBox()
-        self._device_combo.setStyleSheet(f"""
-            QComboBox {{
-                background-color: {ENTRY_BG}; color: {ENTRY_FG}; border: 1px solid {BORDER};
-                border-radius: 4px; padding: 5px 8px; font-size: 12px;
-            }}
-            QComboBox:focus {{ border-color: {ACCENT}; }}
-            QComboBox::drop-down {{ border: none; }}
-            QComboBox QAbstractItemView {{
-                background-color: {ENTRY_BG}; color: {ENTRY_FG};
-                selection-background-color: {ACCENT};
-            }}
-        """)
-        cfg_layout.addWidget(self._device_combo)
-
-        # Buttons row
-        cfg_layout.addSpacing(8)
-        btn_row = QHBoxLayout()
-
-        self._start_btn = QPushButton("▶  Start Listening")
-        self._start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._start_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {ACCENT}; color: white; border: none;
-                border-radius: 6px; padding: 8px 16px; font-size: 12px; font-weight: bold;
-            }}
-            QPushButton:hover {{ background-color: #5a9aff; }}
-        """)
-        self._start_btn.clicked.connect(self._toggle_listening)
-        btn_row.addWidget(self._start_btn)
-
-        clear_btn = QPushButton("Clear")
-        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        clear_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: transparent; color: {MUTED}; border: 1px solid {BORDER};
-                border-radius: 6px; padding: 8px 16px; font-size: 12px;
-            }}
-            QPushButton:hover {{ color: {TEXT}; border-color: {MUTED}; }}
-        """)
-        clear_btn.clicked.connect(self._clear_bullets)
-        btn_row.addWidget(clear_btn)
-
-        cfg_layout.addLayout(btn_row)
-        layout.addWidget(cfg_widget)
-
-        # ── Divider ────────────────────────────────────────────────────────────
-        divider = QFrame()
-        divider.setFixedHeight(1)
-        divider.setStyleSheet(f"background-color: {BORDER};")
-        layout.addWidget(divider)
-
-        # ── Status bar ─────────────────────────────────────────────────────────
-        self._status_label = QLabel("Ready")
-        self._status_label.setStyleSheet(f"color: {MUTED}; font-size: 10px; padding: 4px 12px;")
-        layout.addWidget(self._status_label)
-
-        # ── Bullet area ────────────────────────────────────────────────────────
-        self._bullet_area = QTextEdit()
-        self._bullet_area.setReadOnly(True)
-        self._bullet_area.setStyleSheet(f"""
-            QTextEdit {{
-                background-color: {BG}; color: {TEXT}; border: none;
-                padding: 10px 14px; font-size: 18px; line-height: 1.6;
-            }}
-            QScrollBar:vertical {{
-                background: {BG}; width: 6px; border: none;
-            }}
-            QScrollBar::handle:vertical {{
-                background: {BORDER}; border-radius: 3px; min-height: 20px;
-            }}
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-                height: 0px;
-            }}
-        """)
-        layout.addWidget(self._bullet_area, 1)
-
-        self.setStyleSheet(f"""
-            QMainWindow {{
-                background-color: {BG};
-                border: 1px solid {BORDER};
-                border-radius: 12px;
-            }}
-        """)
-
-    def _make_label(self, text: str, style: str) -> QLabel:
-        lbl = QLabel(text)
-        lbl.setStyleSheet(style)
-        return lbl
-
-    # ── Drag support ───────────────────────────────────────────────────────────
-    def mousePressEvent(self, event):
-        if event.position().y() < 32:
-            self._drag_pos = event.globalPosition().toPoint() - self.pos()
-        else:
-            self._drag_pos = None
-
-    def mouseMoveEvent(self, event):
-        if self._drag_pos is not None:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-
-    def mouseReleaseEvent(self, event):
-        if self._drag_pos is not None:
-            self._drag_pos = None
-            self._cfg["win_x"] = str(self.x())
-            self._cfg["win_y"] = str(self.y())
-            save_config(self._cfg)
-
-    # ── Key visibility toggle ──────────────────────────────────────────────────
-    def _toggle_key_visibility(self):
-        self._key_visible = not self._key_visible
-        self._key_entry.setEchoMode(
-            QLineEdit.EchoMode.Normal if self._key_visible else QLineEdit.EchoMode.Password
+        self._api_var = tk.StringVar(value=self._cfg.get("api_key", ""))
+        self._key_entry = tk.Entry(
+            key_row, textvariable=self._api_var,
+            show="●", bg=ENTRY_BG, fg=ENTRY_FG, insertbackground=ACCENT,
+            relief="flat", font=("SF Pro Display", 11), bd=0,
+            highlightthickness=1, highlightbackground=BORDER,
+            highlightcolor=ACCENT,
         )
+        self._key_entry.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
+        self._key_entry.bind("<KeyRelease>", self._autosave)
 
-    # ── Device list ────────────────────────────────────────────────────────────
-    def _load_devices(self):
+        self._toggle_btn = tk.Button(
+            key_row, text="Show", bg=ENTRY_BG, fg=MUTED, bd=0, cursor="hand2",
+            font=("SF Pro Display", 10), activebackground=ENTRY_BG, activeforeground=ACCENT,
+            command=self._toggle_key_visibility, padx=6,
+        )
+        self._toggle_btn.pack(side="right")
+
+        # Context row
+        self._build_label(self._cfg_frame, "Call Context  (optional — injected into prompt)")
+        self._ctx_text = tk.Text(
+            self._cfg_frame, height=4, bg=ENTRY_BG, fg=ENTRY_FG, insertbackground=ACCENT,
+            relief="flat", font=("SF Pro Display", 11), bd=0, wrap="word",
+            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
+        )
+        self._ctx_text.insert("1.0", self._cfg.get("context", ""))
+        self._ctx_text.pack(fill="x", pady=(2, 6), ipady=4)
+        self._ctx_text.bind("<KeyRelease>", self._autosave)
+
+        # Device row
+        self._build_label(self._cfg_frame, "Audio Input Device")
         self._devices = list_input_devices()
-        self._device_combo.clear()
+        device_names  = [f"[{i}] {n}" for i, n in self._devices]
+
+        self._device_var = tk.StringVar()
         saved_idx = self._cfg.get("device_index", "")
-        select = 0
-        for i, (idx, name) in enumerate(self._devices):
-            self._device_combo.addItem(f"[{idx}] {name}", idx)
-            if str(idx) == str(saved_idx):
-                select = i
-        if self._devices:
-            self._device_combo.setCurrentIndex(select)
+        if saved_idx != "" and self._devices:
+            try:
+                saved_idx_int = int(saved_idx)
+                matches = [d for d in self._devices if d[0] == saved_idx_int]
+                if matches:
+                    self._device_var.set(f"[{matches[0][0]}] {matches[0][1]}")
+            except (ValueError, IndexError):
+                pass
+        if not self._device_var.get() and device_names:
+            self._device_var.set(device_names[0])
 
-    # ── Start / Stop ───────────────────────────────────────────────────────────
-    def _toggle_listening(self):
-        if self._active:
-            self._stop_listening()
-        else:
-            self._start_listening()
+        device_menu = ttk.Combobox(
+            self._cfg_frame, textvariable=self._device_var,
+            values=device_names, state="readonly",
+            font=("SF Pro Display", 11),
+        )
+        device_menu.pack(fill="x", pady=(2, 10))
+        device_menu.bind("<<ComboboxSelected>>", self._autosave)
 
-    def _start_listening(self):
-        api_key = self._key_entry.text().strip() or os.environ.get("GEMINI_API_KEY", "")
-        if not api_key:
-            self._set_status("✗ No API key")
-            return
+        # Style combobox
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("TCombobox",
+                        fieldbackground=ENTRY_BG, background=ENTRY_BG,
+                        foreground=ENTRY_FG, selectbackground=ENTRY_BG,
+                        selectforeground=ENTRY_FG, arrowcolor=ACCENT,
+                        borderwidth=0)
 
-        context = self._context_entry.text().strip()
+        # Start/Stop button
+        self._start_btn = tk.Button(
+            self._cfg_frame, text="🎤  Start Listening",
+            bg=GREEN, fg="white", bd=0, cursor="hand2",
+            font=("SF Pro Display", 13, "bold"), relief="flat",
+            activebackground="#2aa050", activeforeground="white",
+            command=self._toggle_session, pady=7,
+        )
+        self._start_btn.pack(fill="x", pady=(0, 10))
 
-        # Save config
-        self._cfg["api_key"] = self._key_entry.text().strip()
-        self._cfg["context"] = context
-        if self._devices:
-            self._cfg["device_index"] = str(self._device_combo.currentData())
+        # ── Divider ───────────────────────────────────────────────────────────
+        self._divider = tk.Frame(root, bg=BORDER, height=1)
+        self._divider.pack(fill="x", padx=0)
+
+        # ── Suggestions feed ──────────────────────────────────────────────────
+        feed_header = tk.Frame(root, bg=BG)
+        feed_header.pack(fill="x", padx=12, pady=(6, 2))
+        tk.Label(feed_header, text="💡 Suggestions", bg=BG, fg=MUTED,
+                 font=("SF Pro Display", 11, "bold")).pack(side="left")
+        tk.Button(feed_header, text="Clear", bg=BG, fg=MUTED, bd=0, cursor="hand2",
+                  font=("SF Pro Display", 9), activebackground=BG, activeforeground=ACCENT,
+                  command=self._clear_feed).pack(side="right")
+
+        feed_frame = tk.Frame(root, bg=BG)
+        feed_frame.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+
+        self._feed = tk.Text(
+            feed_frame, bg=BG, fg=BODY_FG,
+            font=("SF Pro Display", 16), wrap="word", bd=0,
+            highlightthickness=0, state="disabled", cursor="arrow",
+            spacing1=2, spacing3=6,
+        )
+        self._feed.tag_configure("bullet_dot", foreground=ACCENT,
+                                 font=("SF Pro Display", 18, "bold"))
+        self._feed.tag_configure("bullet_text", foreground=BODY_FG,
+                                 font=("SF Pro Display", 16))
+        self._feed.tag_configure("separator", foreground=BORDER,
+                                 font=("SF Pro Display", 6))
+
+        scroll = tk.Scrollbar(feed_frame, command=self._feed.yview, bg=BG,
+                              troughcolor=BG, activebackground=ACCENT)
+        self._feed.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self._feed.pack(side="left", fill="both", expand=True)
+
+        # ── Status bar ────────────────────────────────────────────────────────
+        self._status_var = tk.StringVar(value="Ready")
+        tk.Label(root, textvariable=self._status_var, bg=BAR_BG, fg=MUTED,
+                 font=("SF Pro Display", 10), anchor="w",
+                 padx=10, pady=4).pack(fill="x", side="bottom")
+
+        self._ready.set()
+        root.after(100, self._poll_queue)
+        root.after(4000, self._check_screenshare)
+        root.after(2000, self._enforce_topmost)
+        root.mainloop()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _build_label(self, parent, text):
+        tk.Label(parent, text=text, bg=BG, fg=MUTED,
+                 font=("SF Pro Display", 10)).pack(anchor="w", pady=(0, 1))
+
+    def _drag_start(self, e):
+        self._drag_x = e.x_root - self._root.winfo_x()
+        self._drag_y = e.y_root - self._root.winfo_y()
+
+    def _drag_motion(self, e):
+        self._root.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
+
+    def _drag_end(self, e):
+        self._cfg["win_x"] = str(self._root.winfo_x())
+        self._cfg["win_y"] = str(self._root.winfo_y())
         save_config(self._cfg)
 
-        device_idx = self._device_combo.currentData() if self._devices else None
+    def _hide(self):
+        if self._root:
+            self._root.withdraw()
+
+    def show(self):
+        self._ui_queue.put(("show", None))
+
+    def _toggle_config(self):
+        """Collapse/expand config section to maximize bullet area."""
+        if self._cfg_visible:
+            self._cfg_frame.pack_forget()
+            self._cfg_visible = False
+        else:
+            # Re-insert config frame between title bar and divider
+            self._cfg_frame.pack(fill="x", padx=12, pady=(10, 0),
+                                 before=self._divider)
+            self._cfg_visible = True
+
+    def _toggle_key_visibility(self):
+        self._key_visible = not self._key_visible
+        self._key_entry.config(show="" if self._key_visible else "●")
+        self._toggle_btn.config(text="Hide" if self._key_visible else "Show")
+
+    def _autosave(self, _event=None):
+        self._cfg["api_key"]      = self._api_var.get().strip()
+        self._cfg["context"]      = self._ctx_text.get("1.0", "end-1c")
+        device_str = self._device_var.get()
+        if device_str.startswith("["):
+            try:
+                idx = int(device_str.split("]")[0][1:])
+                self._cfg["device_index"] = str(idx)
+            except (ValueError, IndexError):
+                pass
+        save_config(self._cfg)
+
+    def _get_device_index(self) -> Optional[int]:
+        device_str = self._device_var.get()
+        if device_str.startswith("["):
+            try:
+                return int(device_str.split("]")[0][1:])
+            except (ValueError, IndexError):
+                pass
+        return None
+
+    def _enforce_topmost(self):
+        """Periodically re-assert topmost to combat macOS de-focusing."""
+        if self._root and self._root.winfo_viewable():
+            self._root.wm_attributes("-topmost", True)
+            self._root.lift()
+        if self._root:
+            self._root.after(3000, self._enforce_topmost)
+
+    # ── Session control ───────────────────────────────────────────────────────
+    def _toggle_session(self):
+        if self._active:
+            self._stop_session()
+        else:
+            self._start_session()
+
+    def _start_session(self):
+        api_key = self._api_var.get().strip()
+        if not api_key:
+            self._set_status("⚠️  Enter API key first")
+            return
+        context = self._ctx_text.get("1.0", "end-1c")
+        device_idx = self._get_device_index()
 
         self._client = GeminiLiveClient(
             api_key=api_key,
             context=context,
-            on_text=lambda t: self._signals.text_received.emit(t),
-            on_status=lambda s: self._signals.status_changed.emit(s),
-            on_error=lambda e: self._signals.error_occurred.emit(e),
+            on_text=self._on_text,
+            on_status=self._set_status,
+            on_error=self._on_error,
         )
         self._client.start()
-
         self._audio = AudioCapture(device_idx, self._client)
         self._audio.start()
-
         self._active = True
-        self._start_btn.setText("⏹  Stop Listening")
-        self._start_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {RED}; color: white; border: none;
-                border-radius: 6px; padding: 8px 16px; font-size: 12px; font-weight: bold;
-            }}
-            QPushButton:hover {{ background-color: #e04848; }}
-        """)
+        self._start_btn.config(text="⏹  Stop", bg=RED, activebackground="#b03030")
+        self.app.set_menu_bar_icon(active=True)
 
-    def _stop_listening(self):
-        if self._audio:
-            self._audio.stop()
-            self._audio = None
+        # Auto-collapse config when session starts to maximize bullet area
+        if self._cfg_visible:
+            self._toggle_config()
+
+        self._autosave()
+        log("[SESSION] Started")
+
+    def _stop_session(self):
         if self._client:
             self._client.stop()
-            self._client = None
+        if self._audio:
+            self._audio.stop()
+        self._client = None
+        self._audio  = None
         self._active = False
+        self._start_btn.config(text="🎤  Start Listening", bg=GREEN, activebackground="#2aa050")
         self._set_status("Stopped")
-        self._start_btn.setText("▶  Start Listening")
-        self._start_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {ACCENT}; color: white; border: none;
-                border-radius: 6px; padding: 8px 16px; font-size: 12px; font-weight: bold;
-            }}
-            QPushButton:hover {{ background-color: #5a9aff; }}
-        """)
+        self.app.set_menu_bar_icon(active=False)
 
-    # ── Signal handlers ────────────────────────────────────────────────────────
+        # Re-expand config when session stops
+        if not self._cfg_visible:
+            self._toggle_config()
+
+        log("[SESSION] Stopped")
+
+    # ── Feed ──────────────────────────────────────────────────────────────────
+    def _on_text(self, text: str):
+        self._ui_queue.put(("text", text))
+
+    def _on_error(self, msg: str):
+        self._ui_queue.put(("status", f"⚠️  {msg}"))
+        log(f"[ERROR] {msg}")
+
+    def _set_status(self, msg: str):
+        self._ui_queue.put(("status", msg))
+
     def _append_bullet(self, text: str):
-        for line in text.split("\n"):
+        """Process incoming text into clean bullet points."""
+        self._feed.configure(state="normal")
+
+        lines = text.splitlines()
+        has_bullets = False
+
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
-            # Strip markdown bullet variants and enforce •
-            if line.startswith(("- ", "* ", "– ")):
-                line = "• " + line[2:]
-            elif line.startswith(("•")):
-                pass  # already correct
-            else:
-                # Non-bullet text from model — skip intros/filler
-                # Only keep if short enough to be useful (likely a bullet without prefix)
-                if len(line) > 80:
-                    continue  # discard paragraph text
-                line = "• " + line
-            colored = line.replace("•", f'<span style="color:{ACCENT}; font-size:20px;">•</span>', 1)
-            self._bullet_area.append(
-                f'<div style="margin: 4px 0; font-size: 18px; color: {TEXT};">{colored}</div>'
-            )
-        sb = self._bullet_area.verticalScrollBar()
-        sb.setValue(sb.maximum())
 
-    def _set_status(self, text: str):
-        log.info("Status: %s", text)
-        self._status_label.setText(text)
+            # Strip any bullet prefix variants and normalize
+            clean = line
+            for prefix in ("•", "- ", "* ", "– ", "· "):
+                if clean.startswith(prefix):
+                    clean = clean[len(prefix):].strip()
+                    break
 
-    def _show_error(self, text: str):
-        log.error("Error shown: %s", text)
-        self._set_status(f"✗ {text}")
-        if self._active:
-            self._stop_listening()
+            # Skip meta-commentary that slips through
+            skip_patterns = [
+                "analyzing", "processing", "let me", "here's",
+                "based on", "great question", "that's interesting",
+                "i can help", "i understand", "certainly",
+                "of course", "sure thing",
+            ]
+            if any(clean.lower().startswith(p) for p in skip_patterns):
+                log(f"[FILTER] Skipped meta-commentary: {clean[:60]}")
+                continue
 
-    def _clear_bullets(self):
-        self._bullet_area.clear()
+            # Skip lines that are too long (paragraph filler)
+            if len(clean) > 100:
+                log(f"[FILTER] Skipped long line ({len(clean)} chars): {clean[:60]}...")
+                continue
 
-    # ── Screenshare check ──────────────────────────────────────────────────────
+            if clean:
+                self._feed.insert("end", "  •  ", "bullet_dot")
+                self._feed.insert("end", clean + "\n", "bullet_text")
+                self._bullet_count += 1
+                has_bullets = True
+
+        if has_bullets:
+            # Add thin separator between response groups
+            self._feed.insert("end", "\n", "separator")
+
+        # Trim old bullets if too many
+        if self._bullet_count > self._max_bullets:
+            lines_to_delete = min(self._bullet_count - self._max_bullets + 5, 15)
+            for _ in range(lines_to_delete):
+                self._feed.delete("1.0", "2.0")
+            self._bullet_count = max(self._bullet_count - lines_to_delete, 0)
+
+        self._feed.see("end")
+        self._feed.configure(state="disabled")
+
+    def _clear_feed(self):
+        self._feed.configure(state="normal")
+        self._feed.delete("1.0", "end")
+        self._feed.configure(state="disabled")
+        self._bullet_count = 0
+
+    # ── Queue poll (runs on tkinter thread) ───────────────────────────────────
+    def _poll_queue(self):
+        try:
+            while True:
+                cmd, arg = self._ui_queue.get_nowait()
+                if cmd == "text":
+                    self._append_bullet(arg)
+                elif cmd == "status":
+                    if self._status_var:
+                        self._status_var.set(arg)
+                elif cmd == "show":
+                    self._root.deiconify()
+                    self._root.lift()
+                    self._root.wm_attributes("-topmost", True)
+        except queue.Empty:
+            pass
+        if self._root:
+            self._root.after(100, self._poll_queue)
+
+    # ── Screenshare auto-hide ─────────────────────────────────────────────────
     def _check_screenshare(self):
-        if is_screensharing() and self.isVisible():
-            self.hide()
-
-    def closeEvent(self, event):
-        event.ignore()
-        self.hide()
-
-
-# ── System Tray ────────────────────────────────────────────────────────────────
-def create_tray_icon(app: QApplication, window: CopilotWindow) -> QSystemTrayIcon:
-    # Create a simple microphone icon
-    pixmap = QPixmap(64, 64)
-    pixmap.fill(QColor(0, 0, 0, 0))
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor(ACCENT))
-    # Mic body
-    painter.drawRoundedRect(22, 8, 20, 32, 10, 10)
-    # Mic stand
-    painter.setBrush(QColor(ACCENT))
-    painter.drawRect(29, 40, 6, 12)
-    painter.drawRect(20, 52, 24, 4)
-    painter.end()
-
-    icon = QIcon(pixmap)
-    tray = QSystemTrayIcon(icon, app)
-
-    menu = QMenu()
-    show_action = QAction("Show / Hide", menu)
-    show_action.triggered.connect(lambda: window.show() if window.isHidden() else window.hide())
-    menu.addAction(show_action)
-
-    quit_action = QAction("Quit Call Copilot", menu)
-    quit_action.triggered.connect(app.quit)
-    menu.addAction(quit_action)
-
-    tray.setContextMenu(menu)
-    tray.activated.connect(lambda reason: (
-        window.show() if window.isHidden() else window.hide()
-    ) if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
-
-    tray.show()
-    return tray
+        if not self._root:
+            return
+        try:
+            if is_screensharing():
+                self._root.withdraw()
+            else:
+                if not self._root.winfo_viewable():
+                    self._root.deiconify()
+                    self._root.lift()
+                    self._root.wm_attributes("-topmost", True)
+        except Exception:
+            pass
+        self._root.after(4000, self._check_screenshare)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
-def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("Call Copilot")
-    app.setQuitOnLastWindowClosed(False)
+# ── rumps menu bar app ─────────────────────────────────────────────────────────
+class CallCopilotApp(rumps.App):
+    def __init__(self):
+        super().__init__("🎤", quit_button=None)
+        self.menu = [
+            rumps.MenuItem("Show / Hide", callback=self._toggle_window),
+            None,
+            rumps.MenuItem("Quit Call Copilot", callback=self._quit),
+        ]
+        self._window: Optional[CopilotWindow] = None
+        self._active = False
 
-    window = CopilotWindow()
-    tray = create_tray_icon(app, window)
-    window.show()
+    def set_menu_bar_icon(self, active: bool):
+        """Blue mic when idle, red dot when listening."""
+        self._active = active
+        self.title = "🔴" if active else "🎤"
 
-    sys.exit(app.exec())
+    @rumps.clicked("Show / Hide")
+    def _toggle_window(self, _=None):
+        if self._window:
+            self._window.show()
+
+    @rumps.clicked("Quit Call Copilot")
+    def _quit(self, _=None):
+        if self._window and self._window._active:
+            self._window._stop_session()
+        rumps.quit_application()
+
+    def run_with_window(self):
+        self._window = CopilotWindow(app_ref=self)
+        self._window.launch()
+        self.run()
 
 
+# ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    app = CallCopilotApp()
+    app.run_with_window()
