@@ -61,11 +61,21 @@ WS_URI_TMPL = (
 )
 
 SYSTEM_PROMPT = (
-    "You are a silent real-time call copilot. "
-    "When you hear a question directed at the user, respond with 2-3 bullet points only. "
-    "Rules: each bullet max 15 words, start with •, one per line, no intro text, no filler. "
-    "If no question is asked, output nothing. "
-    "Use the call context provided to tailor your answers."
+    "You are a real-time call copilot displayed on a tiny screen. "
+    "ABSOLUTE RULES — violating any rule is a critical failure:\n"
+    "1. ONLY output bullet points. Never output a sentence, paragraph, or explanation.\n"
+    "2. Each bullet starts with • and is MAX 10 words.\n"
+    "3. Max 3 bullets per response. Fewer is better.\n"
+    "4. No greetings, no intros, no 'Here are some suggestions', no filler.\n"
+    "5. If nobody asked a question, output NOTHING. Silence is correct.\n"
+    "6. Use the call context to make bullets hyper-relevant.\n"
+    "7. Write at a glance-reading level — the user is mid-conversation and has 1 second to read.\n\n"
+    "GOOD example:\n"
+    "• Budget was $50K last quarter\n"
+    "• Push for Q2 close — they mentioned deadline\n"
+    "• Ask about competing bids\n\n"
+    "BAD example (NEVER do this):\n"
+    "Based on the context of your call, here are some suggestions you might consider..."
 )
 
 # ── Colors ─────────────────────────────────────────────────────────────────────
@@ -365,7 +375,7 @@ class CopilotWindow(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle("Call Copilot")
-        self.setFixedSize(420, 560)
+        self.setFixedSize(440, 640)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -516,7 +526,7 @@ class CopilotWindow(QMainWindow):
         self._bullet_area.setStyleSheet(f"""
             QTextEdit {{
                 background-color: {BG}; color: {TEXT}; border: none;
-                padding: 8px 12px; font-size: 13px; line-height: 1.5;
+                padding: 10px 14px; font-size: 18px; line-height: 1.6;
             }}
             QScrollBar:vertical {{
                 background: {BG}; width: 6px; border: none;
@@ -649,9 +659,23 @@ class CopilotWindow(QMainWindow):
     def _append_bullet(self, text: str):
         for line in text.split("\n"):
             line = line.strip()
-            if line:
-                colored = line.replace("•", f'<span style="color:{ACCENT};">•</span>', 1)
-                self._bullet_area.append(colored)
+            if not line:
+                continue
+            # Strip markdown bullet variants and enforce •
+            if line.startswith(("- ", "* ", "– ")):
+                line = "• " + line[2:]
+            elif line.startswith(("•")):
+                pass  # already correct
+            else:
+                # Non-bullet text from model — skip intros/filler
+                # Only keep if short enough to be useful (likely a bullet without prefix)
+                if len(line) > 80:
+                    continue  # discard paragraph text
+                line = "• " + line
+            colored = line.replace("•", f'<span style="color:{ACCENT}; font-size:20px;">•</span>', 1)
+            self._bullet_area.append(
+                f'<div style="margin: 4px 0; font-size: 18px; color: {TEXT};">{colored}</div>'
+            )
         sb = self._bullet_area.verticalScrollBar()
         sb.setValue(sb.maximum())
 
