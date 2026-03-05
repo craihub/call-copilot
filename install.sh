@@ -1,63 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="https://github.com/craihub/call-copilot.git"
 INSTALL_DIR="$HOME/.call-copilot"
-BIN_DIR="$HOME/.local/bin"
+VENV="$INSTALL_DIR/venv"
+LAUNCHER="$HOME/.local/bin/call-copilot"
+REPO="https://github.com/craihub/call-copilot.git"
 
 echo "→ Installing Call Copilot..."
 
-# Ensure Homebrew
-if ! command -v brew &>/dev/null; then
-  echo "✗ Homebrew required. Install from https://brew.sh"
-  exit 1
-fi
-
-# Install dependencies
+# ── Deps ──────────────────────────────────────────────────────────────────────
 echo "→ Installing dependencies..."
 brew install python@3.11 portaudio 2>/dev/null || true
 
-# Locate python3.11
-PYTHON="$(brew --prefix)/bin/python3.11"
+PYTHON="$(brew --prefix python@3.11)/bin/python3.11"
 if [ ! -x "$PYTHON" ]; then
-  echo "✗ python3.11 not found at $PYTHON"
-  exit 1
+    echo "✗ python@3.11 not found at $PYTHON"
+    exit 1
 fi
 
-echo "→ Using Python: $PYTHON"
-"$PYTHON" --version
-
-# Clone or update repo
-echo "→ Cloning repo..."
+# ── Clone or pull ─────────────────────────────────────────────────────────────
 if [ -d "$INSTALL_DIR/.git" ]; then
-  git -C "$INSTALL_DIR" pull --ff-only
+    echo "→ Updating repo..."
+    cd "$INSTALL_DIR" && git pull --ff-only 2>/dev/null || true
 else
-  git clone "$REPO" "$INSTALL_DIR"
+    echo "→ Cloning repo..."
+    rm -rf "$INSTALL_DIR"
+    git clone "$REPO" "$INSTALL_DIR"
 fi
 
-# Create virtualenv and install dependencies
+# ── Venv ──────────────────────────────────────────────────────────────────────
 echo "→ Creating virtualenv..."
-VENV_DIR="$INSTALL_DIR/.venv"
-"$PYTHON" -m venv "$VENV_DIR"
-"$VENV_DIR/bin/pip" install --upgrade pip -q
-"$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q
+"$PYTHON" -m venv "$VENV" --clear
+"$VENV/bin/pip" install --upgrade pip -q
+"$VENV/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q
 
-# Write launcher
+# ── Launcher ──────────────────────────────────────────────────────────────────
 echo "→ Creating launcher..."
-mkdir -p "$BIN_DIR"
-cat > "$BIN_DIR/call-copilot" << 'LAUNCHEREOF'
+mkdir -p "$HOME/.local/bin"
+cat > "$LAUNCHER" <<'SCRIPT'
 #!/usr/bin/env bash
-cd "$HOME/.call-copilot"
-exec "$HOME/.call-copilot/.venv/bin/python" main.py "$@"
-LAUNCHEREOF
-chmod +x "$BIN_DIR/call-copilot"
-
-# PATH hint
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-  echo ""
-  echo "  ⚠ Add to PATH (one-time):"
-  echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
-fi
+exec "$HOME/.call-copilot/venv/bin/python" "$HOME/.call-copilot/main.py" "$@"
+SCRIPT
+chmod +x "$LAUNCHER"
 
 echo ""
 echo "✓ Installed."
